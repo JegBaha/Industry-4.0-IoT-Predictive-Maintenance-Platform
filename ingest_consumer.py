@@ -1,10 +1,13 @@
 """MQTT consumer inserting into DB."""
 import json
+import time
+import logging
 import paho.mqtt.client as mqtt
-from datetime import datetime
 
 from config import mqtt as mqtt_cfg
 from db import insert_batch
+
+log = logging.getLogger(__name__)
 
 INSERT_SQL = """
 INSERT INTO fact_sensor_readings (
@@ -18,7 +21,7 @@ def _lookup_ids(reading: dict) -> tuple[int, int, int]:
     return 1, 1, 1
 
 
-def consume_once(batch_size: int = 50):
+def consume_forever(batch_size: int = 50):
     rows = []
 
     def on_message(_client, _userdata, msg):
@@ -39,6 +42,7 @@ def consume_once(batch_size: int = 50):
         )
         if len(rows) >= batch_size:
             insert_batch(INSERT_SQL, rows)
+            log.info("Inserted %s rows", len(rows))
             rows = []
 
     client = mqtt.Client(client_id="consumer")
@@ -50,10 +54,11 @@ def consume_once(batch_size: int = 50):
     client.loop_start()
     try:
         while True:
-            pass
+            time.sleep(0.2)
     except KeyboardInterrupt:
         pass
     finally:
         if rows:
             insert_batch(INSERT_SQL, rows)
+            log.info("Inserted final %s rows", len(rows))
         client.loop_stop()
