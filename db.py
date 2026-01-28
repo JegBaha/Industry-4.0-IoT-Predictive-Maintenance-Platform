@@ -33,3 +33,36 @@ def fetch_all(sql: str) -> list[tuple]:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql)
         return cur.fetchall()
+
+
+def fetch_kpi_oee() -> list[dict]:
+    """Fetch OEE KPIs from materialized view."""
+    try:
+        rows = fetch_all("SELECT machine_code, availability, performance, quality, oee FROM mv_kpi_oee")
+        return [
+            {
+                "machine_code": r[0],
+                "availability": float(r[1]) if r[1] else 0.0,
+                "performance": float(r[2]) if r[2] else 0.0,
+                "quality": float(r[3]) if r[3] else 0.0,
+                "oee": float(r[4]) if r[4] else 0.0,
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
+def fetch_kpi_mttr() -> list[dict]:
+    """Fetch MTTR KPIs from materialized view."""
+    try:
+        rows = fetch_all("SELECT machine_code, mttr_minutes FROM mv_mttr")
+        return [
+            {
+                "machine_code": r[0],
+                "mttr_minutes": float(r[1]) if r[1] else 0.0,
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
