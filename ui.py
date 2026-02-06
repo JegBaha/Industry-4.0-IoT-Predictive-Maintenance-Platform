@@ -16,10 +16,14 @@ from mosquitto_runner import ensure_broker_running
 from mqtt_simulator import publish_stream
 from ingest_consumer import consume_forever
 from db import fetch_kpi_oee, fetch_kpi_mttr
+from rag.rag_api import router as rag_router, init_rag
+from erp_mes.erp_api import router as erp_router
 
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="SmartFact Dashboard")
+app.include_router(rag_router)
+app.include_router(erp_router)
 
 # Thread references
 sim_thread: Optional[Thread] = None
@@ -193,6 +197,7 @@ def api_start_all():
     _start_sim()
     _start_consumer()
     _start_listener()
+    init_rag()
     return {"ok": True}
 
 
@@ -1007,6 +1012,366 @@ body {
     background: var(--text-muted);
 }
 
+/* Mode Switcher */
+.mode-switcher {
+    display: flex;
+    gap: 4px;
+    background: var(--bg-primary);
+    border-radius: 8px;
+    padding: 3px;
+    margin-right: 16px;
+}
+
+.mode-btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    white-space: nowrap;
+}
+
+.mode-btn:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+}
+
+.mode-btn.active {
+    background: var(--accent-blue);
+    color: #fff;
+    box-shadow: 0 2px 8px rgba(30, 144, 255, 0.3);
+}
+
+/* ERP Navigation */
+.nav-tabs-erp {
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+    display: none;
+    padding: 0 24px;
+    gap: 4px;
+}
+
+.nav-tabs-erp.active {
+    display: flex;
+}
+
+.nav-tabs-iot {
+    display: flex;
+}
+
+.nav-tabs-iot.hidden {
+    display: none;
+}
+
+/* ERP KPI Cards */
+.erp-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.erp-kpi-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+    transition: all 0.3s;
+}
+
+.erp-kpi-card:hover {
+    border-color: var(--accent-blue);
+    box-shadow: var(--glow-blue);
+}
+
+.erp-kpi-card .kpi-icon {
+    font-size: 28px;
+    margin-bottom: 8px;
+}
+
+.erp-kpi-card h4 {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+    font-weight: 500;
+}
+
+.erp-kpi-card .kpi-value {
+    font-size: 32px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+
+.erp-kpi-card .kpi-subtitle {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.erp-kpi-card .kpi-value.good { color: var(--accent-green); }
+.erp-kpi-card .kpi-value.warning { color: var(--accent-yellow); }
+.erp-kpi-card .kpi-value.bad { color: var(--accent-red); }
+
+/* ERP Charts Grid */
+.erp-charts-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 24px;
+}
+
+/* Orders Table */
+.orders-table-wrapper {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.orders-table-header {
+    background: var(--bg-tertiary);
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.orders-table-header h3 {
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.orders-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.orders-table thead th {
+    background: var(--bg-tertiary);
+    padding: 12px 16px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-color);
+    position: sticky;
+    top: 0;
+}
+
+.orders-table tbody tr {
+    border-bottom: 1px solid var(--border-color);
+    transition: background 0.15s;
+}
+
+.orders-table tbody tr:hover {
+    background: var(--bg-hover);
+}
+
+.orders-table td {
+    padding: 10px 16px;
+    color: var(--text-primary);
+}
+
+.orders-table .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.orders-table .badge.good { background: rgba(0,255,136,0.15); color: var(--accent-green); }
+.orders-table .badge.warning { background: rgba(255,193,7,0.15); color: var(--accent-yellow); }
+.orders-table .badge.bad { background: rgba(255,59,59,0.15); color: var(--accent-red); }
+
+.orders-scroll {
+    max-height: 500px;
+    overflow-y: auto;
+}
+
+/* Predict Form */
+.erp-predict-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+}
+
+.erp-form-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 24px;
+}
+
+.erp-form-card h3 {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 20px;
+    color: var(--accent-cyan);
+}
+
+.form-group {
+    margin-bottom: 16px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+    font-weight: 500;
+}
+
+.form-group input,
+.form-group select {
+    width: 100%;
+    padding: 10px 14px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+    border-color: var(--accent-cyan);
+}
+
+/* Prediction Result */
+.predict-result-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 24px;
+}
+
+.predict-result-card h3 {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 20px;
+    color: var(--accent-cyan);
+}
+
+.predict-gauge {
+    text-align: center;
+    margin-bottom: 20px;
+}
+
+.predict-prob-bar {
+    height: 24px;
+    background: var(--bg-primary);
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 12px 0;
+}
+
+.predict-prob-fill {
+    height: 100%;
+    border-radius: 12px;
+    transition: width 0.5s ease;
+}
+
+.predict-detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 16px;
+}
+
+.predict-detail-item {
+    background: var(--bg-primary);
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+}
+
+.predict-detail-item .label {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+
+.predict-detail-item .value {
+    font-size: 20px;
+    font-weight: 700;
+}
+
+/* Analytics */
+.erp-analytics-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+}
+
+.analytics-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 24px;
+}
+
+.analytics-card h3 {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    color: var(--accent-cyan);
+}
+
+.finding-item {
+    background: var(--bg-primary);
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 12px;
+    border-left: 3px solid var(--accent-blue);
+}
+
+.finding-item.high { border-left-color: var(--accent-red); }
+.finding-item.medium { border-left-color: var(--accent-yellow); }
+.finding-item.low { border-left-color: var(--accent-green); }
+
+.finding-item h4 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+
+.finding-item p {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.recommendation-list {
+    list-style: none;
+    padding: 0;
+}
+
+.recommendation-list li {
+    padding: 10px 14px;
+    background: var(--bg-primary);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    font-size: 13px;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.recommendation-list li::before {
+    content: "\\2713";
+    color: var(--accent-green);
+    font-weight: bold;
+}
+
 /* Responsive */
 @media (max-width: 768px) {
     .header {
@@ -1031,6 +1396,16 @@ body {
     .sensor-row {
         grid-template-columns: 80px 1fr 60px;
     }
+
+    .erp-charts-grid,
+    .erp-predict-layout,
+    .erp-analytics-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .mode-switcher {
+        margin-right: 0;
+    }
 }
 """
 
@@ -1043,6 +1418,10 @@ HTML = """
             <span>Industry 4.0 IoT Platform</span>
         </div>
     </div>
+    <div class="mode-switcher">
+        <button class="mode-btn active" data-mode="iot" onclick="SmartFactory.switchMode('iot')">IoT Izleme</button>
+        <button class="mode-btn" data-mode="erp" onclick="SmartFactory.switchMode('erp')">ERP / MES</button>
+    </div>
     <div class="header-status">
         <div class="status-indicator">
             <div class="status-dot" id="connection-dot"></div>
@@ -1052,11 +1431,18 @@ HTML = """
     </div>
 </div>
 
-<nav class="nav-tabs">
+<nav class="nav-tabs nav-tabs-iot" id="nav-iot">
     <button class="nav-tab active" data-tab="dashboard">Dashboard</button>
     <button class="nav-tab" data-tab="machines">Makineler</button>
     <button class="nav-tab" data-tab="control">Kontrol Paneli</button>
     <button class="nav-tab" data-tab="alarms">Alarmlar</button>
+    <button class="nav-tab" data-tab="rag">RAG Asistan</button>
+</nav>
+<nav class="nav-tabs nav-tabs-erp" id="nav-erp">
+    <button class="nav-tab active" data-tab="erp-dashboard">KPI Dashboard</button>
+    <button class="nav-tab" data-tab="erp-orders">Siparisler</button>
+    <button class="nav-tab" data-tab="erp-predict">Hata Tahmini</button>
+    <button class="nav-tab" data-tab="erp-analytics">Analitik</button>
 </nav>
 
 <main class="main-content">
@@ -1181,6 +1567,306 @@ HTML = """
             </div>
         </div>
     </div>
+
+    <!-- RAG Asistan Tab -->
+    <div class="tab-content" id="tab-rag">
+        <div class="control-panel">
+            <!-- Soru-Cevap Paneli -->
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#128218; Dokuman Tabanli Akilli Asistan</h3>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
+                    ISO 10816 titresim standartlari, OEE hesaplamalari, alarm esikleri ve bakim rehberleri hakkinda soru sorun.
+                </p>
+                <div style="display: flex; gap: 12px; margin-bottom: 16px;">
+                    <input type="text" id="rag-question" placeholder="Ornek: ISO 10816'ya gore 6.2 mm/s titresim degeri hangi seviyede?"
+                        style="flex: 1; padding: 12px 16px; background: var(--bg-primary); border: 1px solid var(--border-color);
+                        border-radius: 8px; color: var(--text-primary); font-size: 14px; outline: none;"
+                        onkeypress="if(event.key==='Enter') SmartFactory.ragQuery()">
+                    <button class="btn btn-primary" onclick="SmartFactory.ragQuery()">
+                        <span>&#128269;</span> Sor
+                    </button>
+                </div>
+
+                <!-- Hizli Sorular -->
+                <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;">
+                    <button class="btn btn-secondary" style="font-size: 12px; padding: 8px 12px;"
+                        onclick="SmartFactory.ragQuickQuery('ISO 10816 titresim limitleri nelerdir?')">
+                        Titresim Limitleri
+                    </button>
+                    <button class="btn btn-secondary" style="font-size: 12px; padding: 8px 12px;"
+                        onclick="SmartFactory.ragQuickQuery('OEE nasil hesaplanir? World class degerler nedir?')">
+                        OEE Hesaplama
+                    </button>
+                    <button class="btn btn-secondary" style="font-size: 12px; padding: 8px 12px;"
+                        onclick="SmartFactory.ragQuickQuery('Rulman ariza belirtileri ve frekanslari nelerdir?')">
+                        Rulman Ariza Teshisi
+                    </button>
+                    <button class="btn btn-secondary" style="font-size: 12px; padding: 8px 12px;"
+                        onclick="SmartFactory.ragQuickQuery('MTBF ve MTTR nedir? Nasil hesaplanir?')">
+                        MTBF / MTTR
+                    </button>
+                    <button class="btn btn-secondary" style="font-size: 12px; padding: 8px 12px;"
+                        onclick="SmartFactory.ragQuickQuery('Alarm yonetimi standartlari ve oncelik seviyeleri nelerdir?')">
+                        Alarm Yonetimi
+                    </button>
+                    <button class="btn btn-secondary" style="font-size: 12px; padding: 8px 12px;"
+                        onclick="SmartFactory.ragQuickQuery('OPC UA nedir? MQTT ile farki nedir?')">
+                        OPC UA vs MQTT
+                    </button>
+                </div>
+
+                <!-- Cevap Alani -->
+                <div id="rag-answer-panel" style="display: none;">
+                    <div style="background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 8px; padding: 20px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                            <h4 style="color: var(--accent-cyan); font-size: 14px;">Cevap</h4>
+                            <span id="rag-confidence" style="font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--bg-tertiary); color: var(--text-secondary);"></span>
+                        </div>
+                        <div id="rag-answer" style="color: var(--text-primary); font-size: 14px; line-height: 1.8; white-space: pre-wrap;"></div>
+                        <div id="rag-sources" style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-color);"></div>
+                    </div>
+                </div>
+                <div id="rag-loading" style="display: none; text-align: center; padding: 20px; color: var(--text-secondary);">
+                    <div class="pulse">Dokumanlar aranip analiz ediliyor...</div>
+                </div>
+            </div>
+
+            <!-- Alarm Analizi -->
+            <div class="control-card">
+                <h3>&#9888; Sensor Deger Analizi</h3>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
+                    Sensor degerini girin, standartlara gore analiz yapilsin.
+                </p>
+                <div style="display: grid; gap: 12px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Makine Kodu</label>
+                            <input type="text" id="rag-alarm-machine" value="MX100" style="width: 100%; padding: 10px; background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 6px; color: var(--text-primary); font-size: 13px;">
+                        </div>
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Sensor Tipi</label>
+                            <select id="rag-alarm-sensor" style="width: 100%; padding: 10px; background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 6px; color: var(--text-primary); font-size: 13px;">
+                                <option value="vibration">Titresim (Vibration)</option>
+                                <option value="temperature">Sicaklik (Temperature)</option>
+                                <option value="current">Akim (Current)</option>
+                                <option value="pressure">Basinc (Pressure)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 12px;">
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Deger</label>
+                            <input type="number" step="0.1" id="rag-alarm-value" value="6.2" style="width: 100%; padding: 10px; background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 6px; color: var(--text-primary); font-size: 13px;">
+                        </div>
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Birim</label>
+                            <input type="text" id="rag-alarm-unit" value="mm/s" style="width: 100%; padding: 10px; background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 6px; color: var(--text-primary); font-size: 13px;">
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" onclick="SmartFactory.ragAnalyzeAlarm()" style="width: 100%;">
+                        <span>&#128300;</span> Analiz Et
+                    </button>
+                </div>
+                <div id="rag-alarm-result" style="margin-top: 16px;"></div>
+            </div>
+
+            <!-- Dokuman Yonetimi -->
+            <div class="control-card">
+                <h3>&#128196; Dokuman Yonetimi</h3>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
+                    PDF veya TXT dokumanlarini yukleyerek bilgi bankasini genisletin.
+                </p>
+                <div style="display: grid; gap: 12px;">
+                    <div style="border: 2px dashed var(--border-color); border-radius: 8px; padding: 24px; text-align: center; cursor: pointer;"
+                         onclick="document.getElementById('rag-file-input').click()">
+                        <div style="font-size: 24px; margin-bottom: 8px;">&#128206;</div>
+                        <div style="color: var(--text-secondary); font-size: 13px;">PDF veya TXT dosya yukle</div>
+                        <input type="file" id="rag-file-input" accept=".pdf,.txt,.md" style="display: none;" onchange="SmartFactory.ragUploadFile(this)">
+                    </div>
+                    <button class="btn btn-secondary" onclick="SmartFactory.ragSaveBuiltin()" style="width: 100%;">
+                        <span>&#128190;</span> Yerlesik Dokumanlari Kaydet
+                    </button>
+                </div>
+
+                <!-- RAG Durumu -->
+                <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-color);">
+                    <h4 style="font-size: 13px; color: var(--text-secondary); margin-bottom: 8px;">Bilgi Bankasi</h4>
+                    <div class="status-list" id="rag-status-list">
+                        <div class="status-row">
+                            <span class="label">Durum</span>
+                            <span class="value" id="rag-status-state">Yukleniyor...</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Toplam Chunk</span>
+                            <span class="value" id="rag-status-chunks">-</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Yuklu Dokumanlar</span>
+                            <span class="value" id="rag-status-docs">-</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== ERP/MES TABS ===== -->
+
+    <!-- ERP Dashboard -->
+    <div class="tab-content" id="tab-erp-dashboard">
+        <div class="erp-kpi-grid" id="erp-kpi-grid">
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#127919;</div>
+                <h4>Plan Gerceklesme</h4>
+                <div class="kpi-value good" id="erp-kpi-fulfillment">--%</div>
+                <div class="kpi-subtitle">Hedef: >= %95</div>
+            </div>
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#9202;</div>
+                <h4>Ort. Gecikme</h4>
+                <div class="kpi-value" id="erp-kpi-delay">-- saat</div>
+                <div class="kpi-subtitle">Hedef: <= 2 saat</div>
+            </div>
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#128295;</div>
+                <h4>Hurda Orani</h4>
+                <div class="kpi-value" id="erp-kpi-scrap">--%</div>
+                <div class="kpi-subtitle">Hedef: <= %2</div>
+            </div>
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#128230;</div>
+                <h4>Toplam Siparis</h4>
+                <div class="kpi-value" id="erp-kpi-orders">--</div>
+                <div class="kpi-subtitle" id="erp-kpi-produced">Uretilen: --</div>
+            </div>
+        </div>
+
+        <div class="erp-charts-grid">
+            <div class="chart-panel">
+                <div class="panel-header">
+                    <h3>Feature Importance (Ozellik Onemi)</h3>
+                </div>
+                <div class="chart-container">
+                    <canvas id="erp-chart-importance" class="chart-canvas"></canvas>
+                </div>
+            </div>
+            <div class="chart-panel">
+                <div class="panel-header">
+                    <h3>Sicaklik - Hata Olasiligi Egrisi</h3>
+                </div>
+                <div class="chart-container">
+                    <canvas id="erp-chart-tempcurve" class="chart-canvas"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ERP Orders -->
+    <div class="tab-content" id="tab-erp-orders">
+        <div class="orders-table-wrapper">
+            <div class="orders-table-header">
+                <h3>Birlesik Siparisler (ERP + MES)</h3>
+                <span class="alarm-count" id="erp-order-count">0</span>
+            </div>
+            <div class="orders-scroll">
+                <table class="orders-table">
+                    <thead>
+                        <tr>
+                            <th>Siparis No</th>
+                            <th>Planlanan</th>
+                            <th>Uretilen</th>
+                            <th>Hata</th>
+                            <th>Gerceklesme</th>
+                            <th>Gecikme (saat)</th>
+                            <th>Hurda Orani</th>
+                        </tr>
+                    </thead>
+                    <tbody id="erp-orders-body">
+                        <tr><td colspan="7" style="text-align:center; color: var(--text-muted); padding: 40px;">Yukleniyor...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ERP Predict -->
+    <div class="tab-content" id="tab-erp-predict">
+        <div class="erp-predict-layout">
+            <div class="erp-form-card">
+                <h3>Hata Tahmin Parametreleri</h3>
+                <div class="form-group">
+                    <label>Sicaklik (C)</label>
+                    <input type="number" id="erp-pred-temp" value="85" min="50" max="120" step="0.5">
+                </div>
+                <div class="form-group">
+                    <label>Hat Hizi (birim/dk)</label>
+                    <input type="number" id="erp-pred-speed" value="90" min="50" max="150" step="1">
+                </div>
+                <div class="form-group">
+                    <label>Vardiya</label>
+                    <select id="erp-pred-shift">
+                        <option value="Day">Gunduz</option>
+                        <option value="Night">Gece</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Operator Deneyimi (yil)</label>
+                    <input type="number" id="erp-pred-exp" value="5" min="0" max="30" step="1">
+                </div>
+                <div class="form-group">
+                    <label>Makine Yasi (ay)</label>
+                    <input type="number" id="erp-pred-age" value="24" min="0" max="120" step="1">
+                </div>
+                <button class="btn btn-primary" onclick="SmartFactory.erpPredict()" style="width:100%; margin-top:8px;">
+                    Tahmin Yap
+                </button>
+            </div>
+
+            <div class="predict-result-card">
+                <h3>Tahmin Sonucu</h3>
+                <div id="erp-predict-result">
+                    <div style="text-align:center; color: var(--text-muted); padding: 60px 0;">
+                        Parametre girin ve "Tahmin Yap" butonuna basin.
+                    </div>
+                </div>
+                <div class="erp-charts-grid" style="margin-top: 20px;">
+                    <div class="chart-panel" style="margin-bottom:0;">
+                        <div class="panel-header"><h3>Feature Importance</h3></div>
+                        <div class="chart-container"><canvas id="erp-chart-importance2" class="chart-canvas"></canvas></div>
+                    </div>
+                    <div class="chart-panel" style="margin-bottom:0;">
+                        <div class="panel-header"><h3>Sicaklik Egrisi</h3></div>
+                        <div class="chart-container"><canvas id="erp-chart-tempcurve2" class="chart-canvas"></canvas></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ERP Analytics -->
+    <div class="tab-content" id="tab-erp-analytics">
+        <div class="erp-analytics-grid">
+            <div class="analytics-card">
+                <h3>Model Bilgisi</h3>
+                <div id="erp-model-info">
+                    <div class="finding-item">
+                        <h4>Random Forest Classifier</h4>
+                        <p>300 agac, max derinlik: 12</p>
+                    </div>
+                </div>
+                <h3 style="margin-top:20px;">ML Bulgulari</h3>
+                <div id="erp-findings">
+                    <div style="text-align:center; color: var(--text-muted); padding: 20px;">Yukleniyor...</div>
+                </div>
+            </div>
+            <div class="analytics-card">
+                <h3>Oneriler</h3>
+                <ul class="recommendation-list" id="erp-recommendations">
+                    <li>Yukleniyor...</li>
+                </ul>
+            </div>
+        </div>
+    </div>
 </main>
 
 <footer class="footer">
@@ -1225,9 +1911,14 @@ const SmartFactory = (function() {
                 return null;
             }
         },
-        async post(url) {
+        async post(url, body) {
             try {
-                const res = await fetch(url, { method: 'POST' });
+                const opts = { method: 'POST' };
+                if (body) {
+                    opts.headers = { 'Content-Type': 'application/json' };
+                    opts.body = JSON.stringify(body);
+                }
+                const res = await fetch(url, opts);
                 return await res.json();
             } catch (e) {
                 console.error('API Error:', e);
@@ -1673,11 +2364,13 @@ const SmartFactory = (function() {
     // Initialize
     function init() {
         setupTabs();
+        setupErpTabs();
         updateClock();
         setInterval(updateClock, 1000);
 
         // Initial load
         refreshAll();
+        ragUpdateStatus();
 
         // Polling intervals
         setInterval(updateMachines, CONFIG.UPDATE_INTERVAL);
@@ -1694,11 +2387,540 @@ const SmartFactory = (function() {
         console.log('SmartFactory Dashboard initialized');
     }
 
+    // ─── RAG Functions ─────────────────────────────────────
+
+    async function ragQuery() {
+        const question = document.getElementById('rag-question')?.value;
+        if (!question) return;
+
+        const answerPanel = document.getElementById('rag-answer-panel');
+        const loading = document.getElementById('rag-loading');
+        if (answerPanel) answerPanel.style.display = 'none';
+        if (loading) loading.style.display = 'block';
+
+        try {
+            const res = await fetch('/api/rag/query', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question, top_k: 5 })
+            });
+            const data = await res.json();
+
+            if (loading) loading.style.display = 'none';
+            if (answerPanel) answerPanel.style.display = 'block';
+
+            const answerEl = document.getElementById('rag-answer');
+            const confidenceEl = document.getElementById('rag-confidence');
+            const sourcesEl = document.getElementById('rag-sources');
+
+            if (answerEl) answerEl.textContent = data.answer || 'Cevap alinamadi';
+            if (confidenceEl) {
+                const conf = Math.round((data.confidence || 0) * 100);
+                confidenceEl.textContent = 'Guven: ' + conf + '%';
+                confidenceEl.style.color = conf > 70 ? 'var(--accent-green)' : conf > 40 ? 'var(--accent-yellow)' : 'var(--accent-red)';
+            }
+            if (sourcesEl && data.sources && data.sources.length > 0) {
+                sourcesEl.innerHTML = '<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Kaynaklar:</div>' +
+                    data.sources.map(s =>
+                        '<div style="font-size: 12px; color: var(--text-secondary); padding: 4px 0;">' +
+                        '<span style="color: var(--accent-cyan);">' + s.source + '</span>' +
+                        (s.page ? ' (s.' + s.page + ')' : '') +
+                        ' - Eslesme: ' + Math.round(s.score * 100) + '%' +
+                        '</div>'
+                    ).join('');
+            }
+        } catch (e) {
+            if (loading) loading.style.display = 'none';
+            if (answerPanel) {
+                answerPanel.style.display = 'block';
+                document.getElementById('rag-answer').textContent = 'Hata: ' + e.message;
+            }
+        }
+    }
+
+    function ragQuickQuery(question) {
+        const input = document.getElementById('rag-question');
+        if (input) input.value = question;
+        ragQuery();
+    }
+
+    async function ragAnalyzeAlarm() {
+        const machine_code = document.getElementById('rag-alarm-machine')?.value || 'MX100';
+        const sensor_type = document.getElementById('rag-alarm-sensor')?.value || 'vibration';
+        const value = parseFloat(document.getElementById('rag-alarm-value')?.value || '0');
+        const unit = document.getElementById('rag-alarm-unit')?.value || '';
+
+        const resultDiv = document.getElementById('rag-alarm-result');
+        if (resultDiv) resultDiv.innerHTML = '<div class="pulse" style="color: var(--text-secondary); text-align: center; padding: 12px;">Analiz ediliyor...</div>';
+
+        try {
+            const res = await fetch('/api/rag/analyze/alarm', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ machine_code, sensor_type, value, unit })
+            });
+            const data = await res.json();
+
+            const statusColors = { normal: 'var(--accent-green)', warning: 'var(--accent-yellow)', critical: 'var(--accent-red)' };
+            const statusColor = statusColors[data.status] || 'var(--text-secondary)';
+
+            resultDiv.innerHTML = `
+                <div style="background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 8px; padding: 16px;">
+                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
+                        <div style="width: 12px; height: 12px; border-radius: 50%; background: ${statusColor}; box-shadow: 0 0 8px ${statusColor};"></div>
+                        <span style="font-size: 16px; font-weight: 700; color: ${statusColor}; text-transform: uppercase;">${data.status || 'unknown'}</span>
+                    </div>
+                    ${data.standard_reference ? '<div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 4px;"><b>Standart:</b> ' + data.standard_reference + '</div>' : ''}
+                    ${data.limit_info ? '<div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 4px;"><b>Limitler:</b> ' + data.limit_info + '</div>' : ''}
+                    ${data.oee_impact ? '<div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 4px;"><b>OEE Etkisi:</b> ' + data.oee_impact + '</div>' : ''}
+                    ${data.root_cause ? '<div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 4px;"><b>Olasi Neden:</b> ' + data.root_cause + '</div>' : ''}
+                    ${data.action ? '<div style="font-size: 12px; color: var(--accent-cyan); margin-top: 8px;"><b>Aksiyon:</b> ' + data.action + '</div>' : ''}
+                    ${data.explanation ? '<div style="font-size: 13px; color: var(--text-primary); margin-top: 8px; line-height: 1.6;">' + data.explanation + '</div>' : ''}
+                </div>
+            `;
+        } catch (e) {
+            resultDiv.innerHTML = '<div style="color: var(--accent-red); padding: 12px;">Hata: ' + e.message + '</div>';
+        }
+    }
+
+    async function ragUploadFile(input) {
+        if (!input.files || !input.files[0]) return;
+        const file = input.files[0];
+        const formData = new FormData();
+        formData.append('file', file);
+
+        try {
+            const res = await fetch('/api/rag/documents/upload', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await res.json();
+            alert('Dokuman yuklendi: ' + file.name + ' (' + (data.chunks || 0) + ' chunk)');
+            ragUpdateStatus();
+        } catch (e) {
+            alert('Yukleme hatasi: ' + e.message);
+        }
+    }
+
+    async function ragSaveBuiltin() {
+        try {
+            await fetch('/api/rag/knowledge/save-builtin', { method: 'POST' });
+            alert('Yerlesik dokumanlar rag_docs/builtin/ dizinine kaydedildi.');
+        } catch (e) {
+            alert('Hata: ' + e.message);
+        }
+    }
+
+    async function ragUpdateStatus() {
+        try {
+            const res = await fetch('/api/rag/status');
+            const data = await res.json();
+
+            const stateEl = document.getElementById('rag-status-state');
+            const chunksEl = document.getElementById('rag-status-chunks');
+            const docsEl = document.getElementById('rag-status-docs');
+
+            if (stateEl) stateEl.textContent = data.status === 'active' ? 'Aktif' : 'Pasif';
+            if (chunksEl) chunksEl.textContent = data.vector_store?.total_chunks || '0';
+            if (docsEl) docsEl.textContent = data.total_documents || '0';
+        } catch (e) {
+            // RAG henuz hazir degil
+        }
+    }
+
+    // ─── ERP/MES Functions ─────────────────────────────────
+
+    const erpState = {
+        currentMode: 'iot',
+        kpis: null,
+        orders: [],
+        analytics: null,
+        featureImportance: null,
+        temperatureCurve: null
+    };
+
+    function switchMode(mode) {
+        erpState.currentMode = mode;
+
+        // Toggle mode buttons
+        document.querySelectorAll('.mode-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.mode === mode);
+        });
+
+        // Toggle nav bars
+        const navIot = document.getElementById('nav-iot');
+        const navErp = document.getElementById('nav-erp');
+        if (mode === 'erp') {
+            navIot.classList.add('hidden');
+            navErp.classList.add('active');
+        } else {
+            navIot.classList.remove('hidden');
+            navErp.classList.remove('active');
+        }
+
+        // Hide all tab contents
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+        // Activate correct tab set
+        if (mode === 'erp') {
+            // Reset IoT tab active states
+            document.querySelectorAll('#nav-iot .nav-tab').forEach(t => t.classList.remove('active'));
+            document.querySelector('#nav-iot .nav-tab').classList.add('active');
+
+            // Set ERP first tab active
+            document.querySelectorAll('#nav-erp .nav-tab').forEach(t => t.classList.remove('active'));
+            document.querySelector('#nav-erp .nav-tab').classList.add('active');
+            document.getElementById('tab-erp-dashboard').classList.add('active');
+
+            // Load ERP data
+            erpRefreshAll();
+        } else {
+            // Reset ERP tab active states
+            document.querySelectorAll('#nav-erp .nav-tab').forEach(t => t.classList.remove('active'));
+            document.querySelector('#nav-erp .nav-tab').classList.add('active');
+
+            // Set IoT first tab active
+            document.querySelectorAll('#nav-iot .nav-tab').forEach(t => t.classList.remove('active'));
+            document.querySelector('#nav-iot .nav-tab').classList.add('active');
+            document.getElementById('tab-dashboard').classList.add('active');
+        }
+    }
+
+    function setupErpTabs() {
+        document.querySelectorAll('#nav-erp .nav-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('#nav-erp .nav-tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                const tabId = 'tab-' + tab.dataset.tab;
+                document.getElementById(tabId)?.classList.add('active');
+
+                // Redraw charts when switching to tabs with charts
+                if (tab.dataset.tab === 'erp-dashboard' || tab.dataset.tab === 'erp-predict') {
+                    setTimeout(() => {
+                        drawFeatureImportanceChart();
+                        drawTemperatureCurveChart();
+                    }, 100);
+                }
+            });
+        });
+    }
+
+    async function erpLoadKPIs() {
+        const data = await API.get('/api/erp/kpi/summary');
+        if (!data) return;
+        erpState.kpis = data;
+
+        const fulfEl = document.getElementById('erp-kpi-fulfillment');
+        const delayEl = document.getElementById('erp-kpi-delay');
+        const scrapEl = document.getElementById('erp-kpi-scrap');
+        const ordersEl = document.getElementById('erp-kpi-orders');
+        const producedEl = document.getElementById('erp-kpi-produced');
+
+        if (fulfEl) {
+            fulfEl.textContent = data.plan_fulfillment_mean + '%';
+            fulfEl.className = 'kpi-value ' + (data.plan_fulfillment_mean >= 95 ? 'good' : data.plan_fulfillment_mean >= 85 ? 'warning' : 'bad');
+        }
+        if (delayEl) {
+            delayEl.textContent = data.delay_hours_mean + ' saat';
+            delayEl.className = 'kpi-value ' + (data.delay_hours_mean <= 2 ? 'good' : data.delay_hours_mean <= 5 ? 'warning' : 'bad');
+        }
+        if (scrapEl) {
+            scrapEl.textContent = data.scrap_rate_mean + '%';
+            scrapEl.className = 'kpi-value ' + (data.scrap_rate_mean <= 2 ? 'good' : data.scrap_rate_mean <= 5 ? 'warning' : 'bad');
+        }
+        if (ordersEl) ordersEl.textContent = data.total_orders;
+        if (producedEl) producedEl.textContent = 'Uretilen: ' + data.total_produced.toLocaleString('tr-TR');
+    }
+
+    async function erpLoadOrders() {
+        const data = await API.get('/api/erp/orders');
+        if (!data) return;
+        erpState.orders = data;
+
+        const countEl = document.getElementById('erp-order-count');
+        if (countEl) countEl.textContent = data.length;
+
+        const tbody = document.getElementById('erp-orders-body');
+        if (!tbody) return;
+
+        tbody.innerHTML = data.map(o => {
+            const fulfClass = o.plan_fulfillment >= 95 ? 'good' : o.plan_fulfillment >= 85 ? 'warning' : 'bad';
+            const delayClass = o.delay_hours <= 0 ? 'good' : o.delay_hours <= 2 ? 'warning' : 'bad';
+            const scrapClass = o.scrap_rate <= 2 ? 'good' : o.scrap_rate <= 5 ? 'warning' : 'bad';
+            return '<tr>' +
+                '<td>' + o.order_id + '</td>' +
+                '<td>' + o.planned_qty + '</td>' +
+                '<td>' + o.produced_qty + '</td>' +
+                '<td>' + o.defect_qty + '</td>' +
+                '<td><span class="badge ' + fulfClass + '">' + o.plan_fulfillment + '%</span></td>' +
+                '<td><span class="badge ' + delayClass + '">' + o.delay_hours + '</span></td>' +
+                '<td><span class="badge ' + scrapClass + '">' + o.scrap_rate + '%</span></td>' +
+                '</tr>';
+        }).join('');
+    }
+
+    async function erpLoadCharts() {
+        const [importance, curve] = await Promise.all([
+            API.get('/api/erp/predict/feature-importance'),
+            API.get('/api/erp/predict/temperature-curve')
+        ]);
+        if (importance) erpState.featureImportance = importance;
+        if (curve) erpState.temperatureCurve = curve;
+        drawFeatureImportanceChart();
+        drawTemperatureCurveChart();
+    }
+
+    function drawFeatureImportanceChart() {
+        const data = erpState.featureImportance;
+        if (!data || !data.length) return;
+
+        const canvasIds = ['erp-chart-importance', 'erp-chart-importance2'];
+        canvasIds.forEach(id => {
+            const canvas = document.getElementById(id);
+            if (!canvas || !canvas.offsetParent) return;
+            const ctx = canvas.getContext('2d');
+            const W = canvas.parentElement.clientWidth;
+            const H = canvas.parentElement.clientHeight || 250;
+            canvas.width = W;
+            canvas.height = H;
+
+            ctx.clearRect(0, 0, W, H);
+
+            const barH = Math.min(30, (H - 40) / data.length - 8);
+            const maxVal = Math.max(...data.map(d => d.importance));
+            const labelW = 140;
+            const barMaxW = W - labelW - 80;
+
+            data.forEach((item, i) => {
+                const y = 20 + i * (barH + 8);
+                const barW = (item.importance / maxVal) * barMaxW;
+
+                // Label
+                ctx.fillStyle = '#8892a0';
+                ctx.font = '12px Segoe UI';
+                ctx.textAlign = 'right';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(item.feature, labelW - 10, y + barH / 2);
+
+                // Bar
+                const grad = ctx.createLinearGradient(labelW, 0, labelW + barW, 0);
+                grad.addColorStop(0, '#1e90ff');
+                grad.addColorStop(1, '#00d4ff');
+                ctx.fillStyle = grad;
+                ctx.beginPath();
+                ctx.roundRect(labelW, y, barW, barH, 4);
+                ctx.fill();
+
+                // Value
+                ctx.fillStyle = '#f0f4f8';
+                ctx.textAlign = 'left';
+                ctx.fillText((item.importance * 100).toFixed(1) + '%', labelW + barW + 8, y + barH / 2);
+            });
+        });
+    }
+
+    function drawTemperatureCurveChart() {
+        const data = erpState.temperatureCurve;
+        if (!data || !data.length) return;
+
+        const canvasIds = ['erp-chart-tempcurve', 'erp-chart-tempcurve2'];
+        canvasIds.forEach(id => {
+            const canvas = document.getElementById(id);
+            if (!canvas || !canvas.offsetParent) return;
+            const ctx = canvas.getContext('2d');
+            const W = canvas.parentElement.clientWidth;
+            const H = canvas.parentElement.clientHeight || 250;
+            canvas.width = W;
+            canvas.height = H;
+
+            ctx.clearRect(0, 0, W, H);
+
+            const pad = { top: 20, right: 30, bottom: 40, left: 50 };
+            const chartW = W - pad.left - pad.right;
+            const chartH = H - pad.top - pad.bottom;
+
+            const temps = data.map(d => d.temperature);
+            const probs = data.map(d => d.defect_probability);
+            const minT = Math.min(...temps);
+            const maxT = Math.max(...temps);
+            const maxP = Math.max(...probs, 0.5);
+
+            // Grid
+            ctx.strokeStyle = '#2a3a4a';
+            ctx.lineWidth = 0.5;
+            for (let i = 0; i <= 4; i++) {
+                const y = pad.top + (chartH / 4) * i;
+                ctx.beginPath();
+                ctx.moveTo(pad.left, y);
+                ctx.lineTo(W - pad.right, y);
+                ctx.stroke();
+
+                ctx.fillStyle = '#5a6a7a';
+                ctx.font = '11px Consolas';
+                ctx.textAlign = 'right';
+                ctx.fillText((maxP * (1 - i / 4) * 100).toFixed(0) + '%', pad.left - 8, y + 4);
+            }
+
+            // X labels
+            ctx.fillStyle = '#5a6a7a';
+            ctx.textAlign = 'center';
+            for (let i = 0; i < temps.length; i += 4) {
+                const x = pad.left + ((temps[i] - minT) / (maxT - minT)) * chartW;
+                ctx.fillText(temps[i].toFixed(0) + 'C', x, H - 8);
+            }
+
+            // Line
+            ctx.beginPath();
+            ctx.strokeStyle = '#ff8c00';
+            ctx.lineWidth = 2.5;
+            ctx.shadowColor = 'rgba(255, 140, 0, 0.4)';
+            ctx.shadowBlur = 8;
+            data.forEach((d, i) => {
+                const x = pad.left + ((d.temperature - minT) / (maxT - minT)) * chartW;
+                const y = pad.top + chartH - (d.defect_probability / maxP) * chartH;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+
+            // Points
+            data.forEach(d => {
+                const x = pad.left + ((d.temperature - minT) / (maxT - minT)) * chartW;
+                const y = pad.top + chartH - (d.defect_probability / maxP) * chartH;
+                ctx.beginPath();
+                ctx.arc(x, y, 3, 0, Math.PI * 2);
+                ctx.fillStyle = '#ff8c00';
+                ctx.fill();
+            });
+
+            // Axis labels
+            ctx.fillStyle = '#8892a0';
+            ctx.font = '12px Segoe UI';
+            ctx.textAlign = 'center';
+            ctx.fillText('Sicaklik (C)', W / 2, H - 2);
+        });
+    }
+
+    async function erpPredict() {
+        const temp = parseFloat(document.getElementById('erp-pred-temp')?.value || '85');
+        const speed = parseFloat(document.getElementById('erp-pred-speed')?.value || '90');
+        const shift = document.getElementById('erp-pred-shift')?.value || 'Day';
+        const exp = parseFloat(document.getElementById('erp-pred-exp')?.value || '5');
+        const age = parseFloat(document.getElementById('erp-pred-age')?.value || '24');
+
+        const resultDiv = document.getElementById('erp-predict-result');
+        if (resultDiv) resultDiv.innerHTML = '<div style="text-align:center; color: var(--text-secondary); padding: 40px;" class="pulse">Tahmin hesaplaniyor...</div>';
+
+        const data = await API.post('/api/erp/predict', {
+            temperature: temp,
+            line_speed: speed,
+            shift: shift,
+            operator_experience: exp,
+            machine_age: age
+        });
+
+        if (!data || !resultDiv) return;
+
+        const prob = (data.defect_probability * 100).toFixed(1);
+        const conf = (data.confidence * 100).toFixed(1);
+        const isDefect = data.predicted_defect;
+        const riskLevel = getRiskLevel(data.defect_probability);
+        const riskText = getRiskText(riskLevel);
+        const riskColors = { low: 'var(--accent-green)', medium: 'var(--accent-yellow)', high: 'var(--accent-orange)', critical: 'var(--accent-red)' };
+        const riskColor = riskColors[riskLevel];
+
+        resultDiv.innerHTML = `
+            <div class="predict-gauge">
+                <div style="font-size: 48px; font-weight: 700; color: ${riskColor};">${prob}%</div>
+                <div style="font-size: 14px; color: var(--text-secondary);">Hata Olasiligi</div>
+            </div>
+            <div class="predict-prob-bar">
+                <div class="predict-prob-fill" style="width: ${prob}%; background: linear-gradient(90deg, var(--accent-green), var(--accent-yellow), var(--accent-red));"></div>
+            </div>
+            <div class="predict-detail-grid">
+                <div class="predict-detail-item">
+                    <div class="label">Risk Seviyesi</div>
+                    <div class="value" style="color: ${riskColor};">${riskText}</div>
+                </div>
+                <div class="predict-detail-item">
+                    <div class="label">Guven</div>
+                    <div class="value" style="color: var(--accent-cyan);">${conf}%</div>
+                </div>
+                <div class="predict-detail-item">
+                    <div class="label">Tahmin</div>
+                    <div class="value" style="color: ${isDefect ? 'var(--accent-red)' : 'var(--accent-green)'};">${isDefect ? 'HATALI' : 'NORMAL'}</div>
+                </div>
+                <div class="predict-detail-item">
+                    <div class="label">Model</div>
+                    <div class="value" style="font-size: 13px; color: var(--text-secondary);">RandomForest</div>
+                </div>
+            </div>
+        `;
+
+        // Refresh charts
+        erpLoadCharts();
+    }
+
+    async function erpLoadAnalytics() {
+        const data = await API.get('/api/erp/analytics');
+        if (!data) return;
+        erpState.analytics = data;
+
+        // Model info
+        const modelEl = document.getElementById('erp-model-info');
+        if (modelEl && data.model_info) {
+            modelEl.innerHTML = `
+                <div class="finding-item">
+                    <h4>${data.model_info.name}</h4>
+                    <p>${data.model_info.trees} agac, max derinlik: ${data.model_info.max_depth} | Durum: ${data.model_info.status}</p>
+                </div>
+            `;
+        }
+
+        // Findings
+        const findingsEl = document.getElementById('erp-findings');
+        if (findingsEl && data.findings) {
+            findingsEl.innerHTML = data.findings.map(f =>
+                '<div class="finding-item ' + f.severity + '">' +
+                '<h4>' + f.title + '</h4>' +
+                '<p>' + f.description + '</p>' +
+                '</div>'
+            ).join('');
+        }
+
+        // Recommendations
+        const recEl = document.getElementById('erp-recommendations');
+        if (recEl && data.recommendations) {
+            recEl.innerHTML = data.recommendations.map(r =>
+                '<li>' + r + '</li>'
+            ).join('');
+        }
+    }
+
+    async function erpRefreshAll() {
+        await Promise.all([
+            erpLoadKPIs(),
+            erpLoadOrders(),
+            erpLoadCharts(),
+            erpLoadAnalytics()
+        ]);
+    }
+
     return {
         init,
         startSystem,
         ackAlarm,
-        refreshAll
+        refreshAll,
+        ragQuery,
+        ragQuickQuery,
+        ragAnalyzeAlarm,
+        ragUploadFile,
+        ragSaveBuiltin,
+        switchMode,
+        erpPredict,
+        erpRefreshAll
     };
 })();
 

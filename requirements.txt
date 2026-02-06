@@ -1,0 +1,39 @@
+# ─── Smart Factory - Industry 4.0 IoT Platform ───────────────
+# Tum bagimliliklari yuklemek icin: pip install -r requirements.txt
+
+# === Web Framework & API ===
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.5.0
+python-multipart>=0.0.6
+
+# === MQTT IoT Messaging ===
+paho-mqtt>=1.6.1
+
+# === Database ===
+psycopg2-binary>=2.9.9
+
+# === Data Processing ===
+numpy>=1.24.0
+pandas>=2.0.0
+
+# === Machine Learning ===
+torch>=2.0.0
+scikit-learn>=1.3.0
+
+# === RAG System - Embedding & Vector Store ===
+sentence-transformers>=2.2.0
+chromadb>=0.4.0
+
+# === RAG System - PDF Processing ===
+PyMuPDF>=1.23.0
+pdfplumber>=0.10.0
+
+# === RAG System - LLM Providers (opsiyonel - en az biri yeterli) ===
+openai>=1.6.0
+anthropic>=0.18.0
+requests>=2.31.0
+
+# === RAG System - Local LLM (opsiyonel) ===
+# transformers>=4.36.0    # Sadece local LLM kullanacaksan ac
+# accelerate>=0.25.0      # transformers icin GPU desteqi

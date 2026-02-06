@@ -49,8 +49,27 @@ class APIConfig:
     debug: bool = os.getenv("API_DEBUG", "true").lower() == "true"
 
 
+@dataclass
+class RAGConfig:
+    data_dir: str = os.getenv("RAG_DATA_DIR", "./rag_data")
+    docs_dir: str = os.getenv("RAG_DOCS_DIR", "./rag_docs")
+    embedding_model: str = os.getenv("RAG_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    llm_provider: str = os.getenv("RAG_LLM_PROVIDER", "ollama")
+    model_name: str = os.getenv("RAG_MODEL_NAME", "llama2")
+    api_base: str = os.getenv("RAG_API_BASE", "http://localhost:11434")
+    api_key: str | None = os.getenv("RAG_API_KEY")
+
+
+@dataclass
+class ERPConfig:
+    data_dir: str = os.getenv("ERP_DATA_DIR", "./erp_mes/data")
+    model_path: str = os.getenv("ERP_MODEL_PATH", "./erp_mes/models")
+
+
 mqtt = MQTTConfig()
 db = DBConfig()
 locales = LocaleConfig()
 model_cfg = ModelConfig()
 api_cfg = APIConfig()
+rag_cfg = RAGConfig()
+erp_cfg = ERPConfig()
