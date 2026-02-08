@@ -1,0 +1,99 @@
+{
+  "kpi_parameters": {
+    "planned_production_time_minutes": 480,
+    "ideal_cycle_times": {
+      "PRD-1001": 12,
+      "PRD-1002": 15,
+      "PRD-1003": 10,
+      "PRD-1004": 14,
+      "PRD-2001": 18,
+      "PRD-2002": 16,
+      "PRD-2003": 20,
+      "default": 15
+    },
+    "oee_targets": {
+      "availability": 0.90,
+      "performance": 0.95,
+      "quality": 0.99,
+      "oee": 0.85
+    },
+    "supplier_targets": {
+      "on_time_delivery_pct": 95,
+      "quality_score_min": 97,
+      "max_delay_days": 2
+    }
+  },
+  "reason_code_mapping": {
+    "RC-001": {
+      "standard_name": "Mechanical Failure",
+      "category": "Equipment",
+      "priority": "High"
+    },
+    "RC-002": {
+      "standard_name": "Electrical Issue",
+      "category": "Equipment",
+      "priority": "High"
+    },
+    "RC-003": {
+      "standard_name": "Material Shortage",
+      "category": "Supply Chain",
+      "priority": "Medium"
+    },
+    "RC-004": {
+      "standard_name": "Quality Check",
+      "category": "Planned",
+      "priority": "Low"
+    },
+    "RC-005": {
+      "standard_name": "Sensor Malfunction",
+      "category": "Equipment",
+      "priority": "High"
+    },
+    "RC-006": {
+      "standard_name": "Tooling Change",
+      "category": "Planned",
+      "priority": "Low"
+    },
+    "RC-007": {
+      "standard_name": "PLC Error",
+      "category": "Equipment",
+      "priority": "High"
+    },
+    "RC-008": {
+      "standard_name": "Preventive Maintenance",
+      "category": "Planned",
+      "priority": "Low"
+    },
+    "RC-009": {
+      "standard_name": "Hydraulic Leak",
+      "category": "Equipment",
+      "priority": "High"
+    },
+    "UNKNOWN": {
+      "standard_name": "Unknown/Unclassified",
+      "category": "Other",
+      "priority": "Medium"
+    }
+  },
+  "data_validation": {
+    "required_columns": {
+      "orders": ["Order_ID", "Plant", "Line", "Product_Code", "Order_Date", "Quantity_Ordered", "Quantity_Produced", "Quantity_Good"],
+      "downtime": ["Downtime_ID", "Plant", "Line", "Start_Time", "End_Time", "Duration_Min", "Reason_Code"],
+      "suppliers": ["Supplier_ID", "Supplier_Name", "PO_Number", "Expected_Date", "Actual_Delivery_Date", "Quantity_Ordered", "Quantity_Delivered"]
+    },
+    "date_formats": ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d %H:%M:%S"],
+    "max_duration_minutes": 480,
+    "min_duration_minutes": 0
+  },
+  "output_settings": {
+    "decimal_places": 2,
+    "percentage_format": true,
+    "include_trends": true,
+    "export_format": "csv"
+  },
+  "plants": ["PLT-01", "PLT-02"],
+  "lines": {
+    "PLT-01": ["LINE-A", "LINE-B"],
+    "PLT-02": ["LINE-C", "LINE-D"]
+  }
+}

@@ -1440,6 +1440,9 @@ HTML = """
 </nav>
 <nav class="nav-tabs nav-tabs-erp" id="nav-erp">
     <button class="nav-tab active" data-tab="erp-dashboard">KPI Dashboard</button>
+    <button class="nav-tab" data-tab="erp-oee">OEE Detay</button>
+    <button class="nav-tab" data-tab="erp-downtime">Durus Analizi</button>
+    <button class="nav-tab" data-tab="erp-suppliers">Tedarikci</button>
     <button class="nav-tab" data-tab="erp-orders">Siparisler</button>
     <button class="nav-tab" data-tab="erp-predict">Hata Tahmini</button>
     <button class="nav-tab" data-tab="erp-analytics">Analitik</button>
@@ -1839,6 +1842,177 @@ HTML = """
                         <div class="chart-container"><canvas id="erp-chart-tempcurve2" class="chart-canvas"></canvas></div>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ERP OEE Detail -->
+    <div class="tab-content" id="tab-erp-oee">
+        <div class="erp-kpi-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#9881;</div>
+                <h4>OEE</h4>
+                <div class="kpi-value" id="oee-val-oee">--%</div>
+                <div class="kpi-subtitle">Hedef: >= %85</div>
+            </div>
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#9200;</div>
+                <h4>Availability</h4>
+                <div class="kpi-value" id="oee-val-avail">--%</div>
+                <div class="kpi-subtitle">Hedef: >= %90</div>
+            </div>
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#9889;</div>
+                <h4>Performance</h4>
+                <div class="kpi-value" id="oee-val-perf">--%</div>
+                <div class="kpi-subtitle">Hedef: >= %95</div>
+            </div>
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#10003;</div>
+                <h4>Quality</h4>
+                <div class="kpi-value" id="oee-val-qual">--%</div>
+                <div class="kpi-subtitle">Hedef: >= %99</div>
+            </div>
+        </div>
+
+        <div class="erp-charts-grid">
+            <div class="erp-kpi-grid" style="grid-template-columns: 1fr 1fr;">
+                <div class="erp-kpi-card">
+                    <h4>MTTR (Ort. Tamir Suresi)</h4>
+                    <div class="kpi-value" id="oee-val-mttr" style="color: var(--accent-yellow);">-- dk</div>
+                    <div class="kpi-subtitle" id="oee-mttr-hours">-- saat</div>
+                </div>
+                <div class="erp-kpi-card">
+                    <h4>MTBF (Arizalar Arasi Sure)</h4>
+                    <div class="kpi-value" id="oee-val-mtbf" style="color: var(--accent-cyan);">-- dk</div>
+                    <div class="kpi-subtitle" id="oee-mtbf-hours">-- saat</div>
+                </div>
+            </div>
+            <div class="erp-kpi-grid" style="grid-template-columns: 1fr 1fr;">
+                <div class="erp-kpi-card">
+                    <h4>Ariza Sayisi</h4>
+                    <div class="kpi-value" id="oee-val-failures" style="color: var(--accent-red);">--</div>
+                    <div class="kpi-subtitle">Planlanmamis duruslar</div>
+                </div>
+                <div class="erp-kpi-card">
+                    <h4>Toplam Tamir Suresi</h4>
+                    <div class="kpi-value" id="oee-val-totalrepair" style="color: var(--accent-orange);">-- dk</div>
+                    <div class="kpi-subtitle">Kumulatif</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="chart-panel">
+            <div class="panel-header">
+                <h3>Haftalik OEE Trendi</h3>
+            </div>
+            <div class="chart-container" style="height: 300px;">
+                <canvas id="oee-chart-weekly" class="chart-canvas"></canvas>
+            </div>
+        </div>
+
+        <div class="erp-kpi-grid" style="margin-top: 20px; grid-template-columns: 1fr 1fr 1fr;">
+            <div class="erp-kpi-card">
+                <h4>Planlanan Sure</h4>
+                <div class="kpi-value" id="oee-val-planned" style="font-size: 24px;">-- dk</div>
+            </div>
+            <div class="erp-kpi-card">
+                <h4>Calisma Suresi</h4>
+                <div class="kpi-value" id="oee-val-operating" style="font-size: 24px;">-- dk</div>
+            </div>
+            <div class="erp-kpi-card">
+                <h4>Planlanmamis Durus</h4>
+                <div class="kpi-value" id="oee-val-unplanned" style="font-size: 24px; color: var(--accent-red);">-- dk</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ERP Downtime Analysis -->
+    <div class="tab-content" id="tab-erp-downtime">
+        <div class="erp-charts-grid">
+            <div class="chart-panel">
+                <div class="panel-header">
+                    <h3>Durus Pareto Analizi</h3>
+                </div>
+                <div class="chart-container" style="height: 350px;">
+                    <canvas id="downtime-chart-pareto" class="chart-canvas"></canvas>
+                </div>
+            </div>
+            <div class="orders-table-wrapper">
+                <div class="orders-table-header">
+                    <h3>Durus Sebepleri Detay</h3>
+                </div>
+                <div class="orders-scroll" style="max-height: 350px;">
+                    <table class="orders-table">
+                        <thead>
+                            <tr>
+                                <th>Kod</th>
+                                <th>Sebep</th>
+                                <th>Kategori</th>
+                                <th>Sure (dk)</th>
+                                <th>Adet</th>
+                                <th>Oran</th>
+                                <th>Kumulatif</th>
+                            </tr>
+                        </thead>
+                        <tbody id="downtime-table-body">
+                            <tr><td colspan="7" style="text-align:center; color: var(--text-muted); padding: 40px;">Yukleniyor...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ERP Supplier Performance -->
+    <div class="tab-content" id="tab-erp-suppliers">
+        <div class="erp-kpi-grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#128666;</div>
+                <h4>Zamaninda Teslimat</h4>
+                <div class="kpi-value" id="sup-val-ontime">--%</div>
+                <div class="kpi-subtitle">Hedef: >= %95</div>
+            </div>
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#128197;</div>
+                <h4>Ort. Gecikme</h4>
+                <div class="kpi-value" id="sup-val-delay">-- gun</div>
+                <div class="kpi-subtitle">Hedef: <= 2 gun</div>
+            </div>
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#128230;</div>
+                <h4>Toplam Teslimat</h4>
+                <div class="kpi-value" id="sup-val-total">--</div>
+                <div class="kpi-subtitle" id="sup-val-late">Geciken: --</div>
+            </div>
+            <div class="erp-kpi-card">
+                <div class="kpi-icon">&#127981;</div>
+                <h4>Tedarikci Sayisi</h4>
+                <div class="kpi-value" id="sup-val-count">--</div>
+                <div class="kpi-subtitle">Aktif tedarikci</div>
+            </div>
+        </div>
+
+        <div class="orders-table-wrapper">
+            <div class="orders-table-header">
+                <h3>Tedarikci Performans Tablosu</h3>
+            </div>
+            <div class="orders-scroll" style="max-height: 400px;">
+                <table class="orders-table">
+                    <thead>
+                        <tr>
+                            <th>Tedarikci</th>
+                            <th>Ulke</th>
+                            <th>Siparis</th>
+                            <th>Zamaninda %</th>
+                            <th>Ort. Gecikme</th>
+                            <th>Kalite Skoru</th>
+                        </tr>
+                    </thead>
+                    <tbody id="supplier-table-body">
+                        <tr><td colspan="6" style="text-align:center; color: var(--text-muted); padding: 40px;">Yukleniyor...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
@@ -2899,12 +3073,292 @@ const SmartFactory = (function() {
         }
     }
 
+    // ─── KPI Automation (OEE, Downtime, Supplier) ──────────
+
+    async function erpLoadOEEDetail() {
+        const [oee, mttr, trends] = await Promise.all([
+            API.get('/api/erp/oee/detail'),
+            API.get('/api/erp/oee/mttr-mtbf'),
+            API.get('/api/erp/oee/weekly-trends')
+        ]);
+
+        if (oee) {
+            const setVal = (id, val, target) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.textContent = val;
+                if (target !== undefined) {
+                    const num = parseFloat(val);
+                    el.className = 'kpi-value ' + (num >= target ? 'good' : num >= target * 0.9 ? 'warning' : 'bad');
+                }
+            };
+            setVal('oee-val-oee', oee.oee_pct + '%', 85);
+            setVal('oee-val-avail', oee.availability_pct + '%', 90);
+            setVal('oee-val-perf', oee.performance_pct + '%', 95);
+            setVal('oee-val-qual', oee.quality_pct + '%', 99);
+
+            const el = (id, txt) => { const e = document.getElementById(id); if (e) e.textContent = txt; };
+            el('oee-val-planned', Math.round(oee.planned_time_min) + ' dk');
+            el('oee-val-operating', Math.round(oee.operating_time_min) + ' dk');
+            el('oee-val-unplanned', Math.round(oee.unplanned_downtime_min) + ' dk');
+        }
+
+        if (mttr) {
+            const el = (id, txt) => { const e = document.getElementById(id); if (e) e.textContent = txt; };
+            el('oee-val-mttr', mttr.mttr_min + ' dk');
+            el('oee-mttr-hours', mttr.mttr_hours + ' saat');
+            el('oee-val-mtbf', mttr.mtbf_min + ' dk');
+            el('oee-mtbf-hours', mttr.mtbf_hours + ' saat');
+            el('oee-val-failures', mttr.failure_count);
+            el('oee-val-totalrepair', mttr.total_repair_time_min + ' dk');
+        }
+
+        if (trends && trends.length) {
+            drawWeeklyOEEChart(trends);
+        }
+    }
+
+    function drawWeeklyOEEChart(trends) {
+        const canvas = document.getElementById('oee-chart-weekly');
+        if (!canvas || !canvas.offsetParent) return;
+        const ctx = canvas.getContext('2d');
+        const W = canvas.parentElement.clientWidth;
+        const H = canvas.parentElement.clientHeight || 280;
+        canvas.width = W;
+        canvas.height = H;
+        ctx.clearRect(0, 0, W, H);
+
+        const pad = { top: 30, right: 30, bottom: 50, left: 50 };
+        const cW = W - pad.left - pad.right;
+        const cH = H - pad.top - pad.bottom;
+
+        // Grid
+        ctx.strokeStyle = '#2a3a4a';
+        ctx.lineWidth = 0.5;
+        ctx.fillStyle = '#5a6a7a';
+        ctx.font = '11px Consolas';
+        ctx.textAlign = 'right';
+        for (let i = 0; i <= 5; i++) {
+            const y = pad.top + (cH / 5) * i;
+            const val = 100 - i * 20;
+            ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+            ctx.fillText(val + '%', pad.left - 8, y + 4);
+        }
+
+        // Target line at 85%
+        const targetY = pad.top + cH * (1 - 85 / 100);
+        ctx.strokeStyle = 'rgba(255, 59, 59, 0.5)';
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath(); ctx.moveTo(pad.left, targetY); ctx.lineTo(W - pad.right, targetY); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#ff3b3b';
+        ctx.textAlign = 'left';
+        ctx.fillText('Hedef %85', W - pad.right + 4, targetY + 4);
+
+        const barW = Math.min(40, (cW / trends.length) - 8);
+        const colors = { oee: '#1e90ff', availability: '#00ff88', performance: '#ffc107', quality: '#00d4ff' };
+        const metrics = ['availability_pct', 'performance_pct', 'quality_pct', 'oee_pct'];
+        const metricColors = [colors.availability, colors.performance, colors.quality, colors.oee];
+
+        // X labels + OEE bars
+        ctx.textAlign = 'center';
+        trends.forEach((t, i) => {
+            const x = pad.left + (i + 0.5) * (cW / trends.length);
+
+            // OEE bar
+            const barH = (t.oee_pct / 100) * cH;
+            const grad = ctx.createLinearGradient(0, pad.top + cH - barH, 0, pad.top + cH);
+            grad.addColorStop(0, '#1e90ff');
+            grad.addColorStop(1, '#0a4a8f');
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.roundRect(x - barW / 2, pad.top + cH - barH, barW, barH, 3);
+            ctx.fill();
+
+            // Value on top
+            ctx.fillStyle = '#f0f4f8';
+            ctx.font = '11px Segoe UI';
+            ctx.fillText(t.oee_pct + '%', x, pad.top + cH - barH - 6);
+
+            // X label
+            ctx.fillStyle = '#5a6a7a';
+            ctx.fillText(t.week_label, x, H - 10);
+        });
+
+        // Legend
+        ctx.font = '11px Segoe UI';
+        ctx.textAlign = 'left';
+        const legendItems = [['OEE', '#1e90ff'], ['Hedef', '#ff3b3b']];
+        legendItems.forEach(([label, color], i) => {
+            const lx = pad.left + i * 80;
+            ctx.fillStyle = color;
+            ctx.fillRect(lx, 6, 12, 12);
+            ctx.fillStyle = '#8892a0';
+            ctx.fillText(label, lx + 16, 16);
+        });
+    }
+
+    async function erpLoadDowntime() {
+        const data = await API.get('/api/erp/downtime/pareto');
+        if (!data || !data.length) return;
+
+        // Table
+        const tbody = document.getElementById('downtime-table-body');
+        if (tbody) {
+            tbody.innerHTML = data.map(d => {
+                const prioClass = d.priority === 'High' ? 'bad' : d.priority === 'Medium' ? 'warning' : 'good';
+                return '<tr>' +
+                    '<td>' + d.reason_code + '</td>' +
+                    '<td>' + d.reason_name + '</td>' +
+                    '<td><span class="badge ' + prioClass + '">' + d.category + '</span></td>' +
+                    '<td>' + d.total_duration_min + '</td>' +
+                    '<td>' + d.occurrence_count + '</td>' +
+                    '<td>' + d.duration_pct + '%</td>' +
+                    '<td>' + d.cumulative_pct + '%</td>' +
+                    '</tr>';
+            }).join('');
+        }
+
+        // Pareto chart
+        drawParetoChart(data);
+    }
+
+    function drawParetoChart(data) {
+        const canvas = document.getElementById('downtime-chart-pareto');
+        if (!canvas || !canvas.offsetParent) return;
+        const ctx = canvas.getContext('2d');
+        const W = canvas.parentElement.clientWidth;
+        const H = canvas.parentElement.clientHeight || 320;
+        canvas.width = W;
+        canvas.height = H;
+        ctx.clearRect(0, 0, W, H);
+
+        const pad = { top: 20, right: 50, bottom: 60, left: 50 };
+        const cW = W - pad.left - pad.right;
+        const cH = H - pad.top - pad.bottom;
+        const maxDur = Math.max(...data.map(d => d.total_duration_min));
+
+        // Y axis (duration)
+        ctx.fillStyle = '#5a6a7a';
+        ctx.font = '11px Consolas';
+        ctx.textAlign = 'right';
+        for (let i = 0; i <= 4; i++) {
+            const y = pad.top + (cH / 4) * i;
+            const val = Math.round(maxDur * (1 - i / 4));
+            ctx.beginPath(); ctx.strokeStyle = '#2a3a4a'; ctx.lineWidth = 0.5;
+            ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+            ctx.fillText(val + ' dk', pad.left - 8, y + 4);
+        }
+
+        // Right axis (cumulative %)
+        ctx.textAlign = 'left';
+        for (let i = 0; i <= 4; i++) {
+            const y = pad.top + (cH / 4) * i;
+            ctx.fillText((100 - i * 25) + '%', W - pad.right + 8, y + 4);
+        }
+
+        const barW = Math.min(50, (cW / data.length) - 12);
+        const barColors = ['#ff3b3b', '#ff8c00', '#ffc107', '#1e90ff', '#00d4ff', '#00ff88', '#8892a0', '#5a6a7a', '#3a4a5a', '#2a3a4a'];
+
+        // Bars
+        data.forEach((d, i) => {
+            const x = pad.left + (i + 0.5) * (cW / data.length);
+            const barH = (d.total_duration_min / maxDur) * cH;
+
+            ctx.fillStyle = barColors[i % barColors.length];
+            ctx.beginPath();
+            ctx.roundRect(x - barW / 2, pad.top + cH - barH, barW, barH, 3);
+            ctx.fill();
+
+            // Value on bar
+            ctx.fillStyle = '#f0f4f8';
+            ctx.font = '10px Segoe UI';
+            ctx.textAlign = 'center';
+            ctx.fillText(d.total_duration_min + 'dk', x, pad.top + cH - barH - 6);
+
+            // X label (rotated)
+            ctx.save();
+            ctx.translate(x, H - 5);
+            ctx.rotate(-Math.PI / 6);
+            ctx.fillStyle = '#8892a0';
+            ctx.font = '10px Segoe UI';
+            ctx.textAlign = 'right';
+            ctx.fillText(d.reason_name, 0, 0);
+            ctx.restore();
+        });
+
+        // Cumulative line
+        ctx.beginPath();
+        ctx.strokeStyle = '#00ff88';
+        ctx.lineWidth = 2;
+        data.forEach((d, i) => {
+            const x = pad.left + (i + 0.5) * (cW / data.length);
+            const y = pad.top + cH - (d.cumulative_pct / 100) * cH;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        // Cumulative dots
+        data.forEach((d, i) => {
+            const x = pad.left + (i + 0.5) * (cW / data.length);
+            const y = pad.top + cH - (d.cumulative_pct / 100) * cH;
+            ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2);
+            ctx.fillStyle = '#00ff88'; ctx.fill();
+        });
+    }
+
+    async function erpLoadSuppliers() {
+        const data = await API.get('/api/erp/suppliers');
+        if (!data || data.error) return;
+
+        const el = (id, txt) => { const e = document.getElementById(id); if (e) e.textContent = txt; };
+        const setKpi = (id, val, target, invert) => {
+            const e = document.getElementById(id);
+            if (!e) return;
+            e.textContent = val;
+            const num = parseFloat(val);
+            if (invert) {
+                e.className = 'kpi-value ' + (num <= target ? 'good' : num <= target * 2 ? 'warning' : 'bad');
+            } else {
+                e.className = 'kpi-value ' + (num >= target ? 'good' : num >= target * 0.9 ? 'warning' : 'bad');
+            }
+        };
+
+        setKpi('sup-val-ontime', data.overall_on_time_pct + '%', 95);
+        setKpi('sup-val-delay', data.avg_delay_days + ' gun', 2, true);
+        el('sup-val-total', data.total_deliveries);
+        el('sup-val-late', 'Geciken: ' + data.late_deliveries);
+        el('sup-val-count', data.supplier_count);
+
+        // Supplier table
+        const tbody = document.getElementById('supplier-table-body');
+        if (tbody && data.suppliers) {
+            tbody.innerHTML = data.suppliers.map(s => {
+                const otClass = s.on_time_pct >= 80 ? 'good' : s.on_time_pct >= 50 ? 'warning' : 'bad';
+                const qClass = s.avg_quality_score >= 97 ? 'good' : s.avg_quality_score >= 95 ? 'warning' : 'bad';
+                const dClass = s.avg_delay_days <= 0 ? 'good' : s.avg_delay_days <= 2 ? 'warning' : 'bad';
+                return '<tr>' +
+                    '<td><strong>' + s.supplier_name + '</strong><br><span style="font-size:11px;color:var(--text-muted);">' + s.supplier_id + '</span></td>' +
+                    '<td>' + s.country + '</td>' +
+                    '<td>' + s.order_count + '</td>' +
+                    '<td><span class="badge ' + otClass + '">' + s.on_time_pct + '%</span></td>' +
+                    '<td><span class="badge ' + dClass + '">' + s.avg_delay_days + ' gun</span></td>' +
+                    '<td><span class="badge ' + qClass + '">' + s.avg_quality_score + '</span></td>' +
+                    '</tr>';
+            }).join('');
+        }
+    }
+
     async function erpRefreshAll() {
         await Promise.all([
             erpLoadKPIs(),
             erpLoadOrders(),
             erpLoadCharts(),
-            erpLoadAnalytics()
+            erpLoadAnalytics(),
+            erpLoadOEEDetail(),
+            erpLoadDowntime(),
+            erpLoadSuppliers()
         ]);
     }
 

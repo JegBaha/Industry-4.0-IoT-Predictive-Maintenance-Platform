@@ -5,6 +5,8 @@ from pydantic import BaseModel
 from .kpi_service import get_summary, get_trends
 from .data_service import get_unified, refresh_cache
 from .ml_service import erp_ml
+from . import kpi_automation as kpi_auto
+from .kpi_automation import _to_native
 
 router = APIRouter(prefix="/api/erp", tags=["ERP/MES"])
 
@@ -101,3 +103,30 @@ def temperature_curve():
 @router.get("/analytics")
 def analytics():
     return erp_ml.get_analytics()
+
+
+# ─── KPI Automation Endpoints ─────────────────────────────
+
+@router.get("/oee/detail")
+def oee_detail(line: str = "ALL"):
+    return _to_native(kpi_auto.get_oee_detail(line))
+
+
+@router.get("/oee/mttr-mtbf")
+def mttr_mtbf(line: str = "ALL"):
+    return _to_native(kpi_auto.get_mttr_mtbf(line))
+
+
+@router.get("/oee/weekly-trends")
+def oee_weekly_trends():
+    return _to_native(kpi_auto.get_weekly_trends())
+
+
+@router.get("/downtime/pareto")
+def downtime_pareto(top_n: int = 10):
+    return _to_native(kpi_auto.get_downtime_pareto(top_n))
+
+
+@router.get("/suppliers")
+def supplier_performance():
+    return _to_native(kpi_auto.get_supplier_performance())
