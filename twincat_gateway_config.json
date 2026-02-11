@@ -1,0 +1,38 @@
+{
+  "twincat": {
+    "ams_net_id": "5.80.201.232.1.1",
+    "ams_port": 851,
+    "plc_ip": "192.168.1.10"
+  },
+  "machines": [
+    {
+      "machine_code": "MX100",
+      "line": "Line1",
+      "tags": {
+        "temperature": "GVL_Sensors.MX100_Temperature",
+        "vibration": "GVL_Sensors.MX100_Vibration",
+        "current": "GVL_Sensors.MX100_Current",
+        "throughput": "GVL_Sensors.MX100_Throughput",
+        "failure_flag": "GVL_Sensors.MX100_FailureFlag"
+      }
+    },
+    {
+      "machine_code": "MX200",
+      "line": "Line2",
+      "tags": {
+        "temperature": "GVL_Sensors.MX200_Temperature",
+        "vibration": "GVL_Sensors.MX200_Vibration",
+        "current": "GVL_Sensors.MX200_Current",
+        "throughput": "GVL_Sensors.MX200_Throughput",
+        "failure_flag": "GVL_Sensors.MX200_FailureFlag"
+      }
+    }
+  ],
+  "mqtt": {
+    "host": "localhost",
+    "port": 1883,
+    "base_topic": "factory",
+    "qos": 1
+  },
+  "poll_interval_sec": 0.5
+}

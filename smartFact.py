@@ -4,10 +4,11 @@ from mosquitto_runner import ensure_broker_running
 from mqtt_simulator import publish_stream
 from ingest_consumer import consume_forever
 from threading import Thread
+from observability import setup_logging
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    setup_logging(json_format=True)
     logging.info("Starting Smart Factory simulator (MQTT publisher + consumer)")
     ensure_broker_running()
     machines = [("MX100", "Line1"), ("MX200", "Line2")]

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c:*)",
+      "Bash(curl:*)",
+      "Bash(node --check:*)",
+      "Bash(del \"c:\\\\Users\\\\bahab\\\\OneDrive\\\\Masaüstü\\\\All documents\\\\smartFact\\\\_debug_js.js\")",
+      "Bash(del \"c:\\\\Users\\\\bahab\\\\OneDrive\\\\Masaüstü\\\\All documents\\\\smartFact\\\\test_output.html\")",
+      "Bash(tasklist:*)",
+      "Bash(taskkill:*)"
+    ]
+  }
+}

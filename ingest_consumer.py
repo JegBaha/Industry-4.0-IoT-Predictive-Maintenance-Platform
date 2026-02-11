@@ -6,6 +6,7 @@ import paho.mqtt.client as mqtt
 
 from config import mqtt as mqtt_cfg
 from db import insert_batch
+from observability import db_insert_latency, db_insert_rows, new_correlation_id
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ def consume_forever(batch_size: int = 50):
 
     def on_message(_client, _userdata, msg):
         nonlocal rows
+        new_correlation_id()
         reading = json.loads(msg.payload.decode())
         machine_id, time_id, shift_id = _lookup_ids(reading)
         rows.append(
@@ -41,7 +43,9 @@ def consume_forever(batch_size: int = 50):
             )
         )
         if len(rows) >= batch_size:
-            insert_batch(INSERT_SQL, rows)
+            with db_insert_latency.time():
+                insert_batch(INSERT_SQL, rows)
+            db_insert_rows.inc(len(rows))
             log.info("Inserted %s rows", len(rows))
             rows = []
 
@@ -59,6 +63,8 @@ def consume_forever(batch_size: int = 50):
         pass
     finally:
         if rows:
-            insert_batch(INSERT_SQL, rows)
+            with db_insert_latency.time():
+                insert_batch(INSERT_SQL, rows)
+            db_insert_rows.inc(len(rows))
             log.info("Inserted final %s rows", len(rows))
         client.loop_stop()

@@ -6,6 +6,7 @@ import paho.mqtt.client as mqtt
 
 from config import mqtt as mqtt_cfg
 from data_generator import generate_stream
+from observability import mqtt_publish_total
 
 log = logging.getLogger(__name__)
 
@@ -26,5 +27,6 @@ def publish_stream(machines: list[tuple[str, str]], client_id: str = "simulator"
         payload = json.dumps(reading.__dict__)
         topic = _topic(reading.line, reading.machine_code)
         client.publish(topic, payload, qos=mqtt_cfg.qos)
+        mqtt_publish_total.labels(machine=reading.machine_code).inc()
         log.debug("PUB %s %s", topic, payload)
         time.sleep(0.5)

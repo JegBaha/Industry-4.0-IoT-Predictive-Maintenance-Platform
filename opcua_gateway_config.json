@@ -1,0 +1,17 @@
+{
+    "server_url": "opc.tcp://0.0.0.0:4840",
+    "namespace": "urn:smartfact:server",
+    "security_policy": "None",
+    "simulation_mode": true,
+    "subscription_interval": 500,
+    "machines": {
+        "MX100": {
+            "line": "Line1",
+            "node_prefix": "ns=2;s=Factory.Line1.MX100"
+        },
+        "MX200": {
+            "line": "Line2",
+            "node_prefix": "ns=2;s=Factory.Line2.MX200"
+        }
+    }
+}

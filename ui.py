@@ -9,26 +9,55 @@ from dataclasses import dataclass, field
 
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
-from config import mqtt as mqtt_cfg
+from config import mqtt as mqtt_cfg, db as db_cfg
 from mosquitto_runner import ensure_broker_running
 from mqtt_simulator import publish_stream
 from ingest_consumer import consume_forever
 from db import fetch_kpi_oee, fetch_kpi_mttr
 from rag.rag_api import router as rag_router, init_rag
 from erp_mes.erp_api import router as erp_router
+from packml.packml_api import router as packml_router
+from packml.state_machine import get_machine, get_all_machines, init_machines as packml_init
+from digital_twin.twin_api import router as twin_router, get_engine as get_twin_engine
+from mes.mes_api import router as mes_router
+from spc.spc_api import router as spc_router, feed_sample as spc_feed
+from condition_monitoring.cm_api import router as cm_router, feed_vibration as cm_feed
+from energy.energy_api import router as energy_router, get_service as get_energy_service
+from traceability.trace_api import router as trace_router
+from edge.edge_api import router as edge_router, get_rule_engine as get_edge_rules
+# twincat_gateway is imported lazily — pyads needs TcAdsDll.dll (TwinCAT machines only)
+from observability import (
+    setup_logging, new_correlation_id,
+    mqtt_messages_received, alarm_total, alarm_active, uptime_seconds,
+    run_health_checks, generate_latest, CONTENT_TYPE_LATEST,
+)
 
+setup_logging(json_format=True)
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="SmartFact Dashboard")
 app.include_router(rag_router)
 app.include_router(erp_router)
+app.include_router(packml_router)
+app.include_router(twin_router)
+app.include_router(mes_router)
+app.include_router(spc_router)
+app.include_router(cm_router)
+app.include_router(energy_router)
+app.include_router(trace_router)
+app.include_router(edge_router)
+
+# Initialize PackML state machines for all known machines
+packml_init(["MX100", "MX200"])
 
 # Thread references
 sim_thread: Optional[Thread] = None
 consumer_thread: Optional[Thread] = None
 listener_thread: Optional[Thread] = None
+gateway_thread: Optional[Thread] = None
+gateway_instance = None  # TwinCATGateway (lazy loaded)
 
 # Real-time data storage
 messages_buffer: deque[str] = deque(maxlen=50)
@@ -106,9 +135,11 @@ def check_alarms(machine_code: str, data: dict):
                     "timestamp": time.time(),
                     "acknowledged": False,
                 })
+                alarm_total.labels(machine=machine_code, sensor=sensor.replace("_low", ""), severity=severity).inc()
                 # Keep only last 100 alarms
                 if len(alarms) > 100:
                     alarms = alarms[-100:]
+                alarm_active.set(sum(1 for a in alarms if not a["acknowledged"]))
 
 
 def _start_sim():
@@ -152,6 +183,7 @@ def _start_listener():
 
     def on_message(_client, _userdata, msg):
         try:
+            new_correlation_id()
             payload = msg.payload.decode()
             messages_buffer.append(f"{msg.topic} {payload}")
 
@@ -160,6 +192,7 @@ def _start_listener():
                 data = json.loads(payload)
                 machine_code = data.get("machine_code")
                 if machine_code and machine_code in machine_states:
+                    mqtt_messages_received.labels(machine=machine_code).inc()
                     machine_states[machine_code].latest = data
                     machine_states[machine_code].history.append({
                         "timestamp": data.get("timestamp", time.time()),
@@ -169,6 +202,33 @@ def _start_listener():
                         "throughput": data.get("throughput", 0),
                     })
                     check_alarms(machine_code, data)
+
+                    # Feed data to all subsystems
+                    ts = data.get("timestamp", time.time())
+                    try:
+                        get_twin_engine().update(machine_code, data)
+                    except Exception:
+                        pass
+                    try:
+                        for sensor in ("temperature", "vibration", "current"):
+                            val = data.get(sensor)
+                            if val is not None:
+                                spc_feed(machine_code, sensor, val, ts)
+                    except Exception:
+                        pass
+                    try:
+                        cm_feed(machine_code, data.get("vibration", 0), ts)
+                    except Exception:
+                        pass
+                    try:
+                        get_energy_service().feed(machine_code, data.get("current", 0),
+                                                  data.get("throughput", 0), ts)
+                    except Exception:
+                        pass
+                    try:
+                        get_edge_rules().evaluate(data)
+                    except Exception:
+                        pass
             except json.JSONDecodeError:
                 pass
         except Exception as exc:
@@ -186,6 +246,42 @@ def _start_listener():
     listener_thread = Thread(target=run_listener, daemon=True)
     listener_thread.start()
     log.info("Dashboard listener thread started")
+
+
+def _start_gateway(config_path: str = "twincat_gateway_config.json"):
+    global gateway_thread, gateway_instance
+    if gateway_thread and gateway_thread.is_alive():
+        return
+    ensure_broker_running()
+    try:
+        from twincat_gateway import TwinCATGateway, load_config as load_gw_config
+    except ImportError as exc:
+        log.error("TwinCAT gateway not available (pyads/TcAdsDll.dll missing): %s", exc)
+        return
+    try:
+        config = load_gw_config(config_path)
+    except FileNotFoundError:
+        log.error("Gateway config not found: %s", config_path)
+        return
+
+    gateway_instance = TwinCATGateway(config)
+
+    def run_gateway():
+        try:
+            gateway_instance.run()
+        except Exception as exc:
+            log.exception("Gateway stopped with error: %s", exc)
+
+    gateway_thread = Thread(target=run_gateway, daemon=True)
+    gateway_thread.start()
+    log.info("TwinCAT gateway thread started")
+
+
+def _stop_gateway():
+    global gateway_instance
+    if gateway_instance:
+        gateway_instance._running = False
+        log.info("TwinCAT gateway stop signal sent")
 
 
 # ============================================================================
@@ -206,6 +302,22 @@ def api_stop_all():
     return {"ok": True, "message": "Stop requires restart"}
 
 
+@app.post("/api/system/start-gateway")
+def api_start_gateway():
+    # Start gateway instead of simulator — do NOT start sim
+    _start_gateway()
+    _start_consumer()
+    _start_listener()
+    init_rag()
+    return {"ok": True, "source": "twincat"}
+
+
+@app.post("/api/system/stop-gateway")
+def api_stop_gateway():
+    _stop_gateway()
+    return {"ok": True}
+
+
 @app.get("/api/system/status")
 def api_system_status():
     return {
@@ -213,8 +325,23 @@ def api_system_status():
         "simulation": "running" if sim_thread and sim_thread.is_alive() else "stopped",
         "consumer": "running" if consumer_thread and consumer_thread.is_alive() else "stopped",
         "listener": "running" if listener_thread and listener_thread.is_alive() else "stopped",
+        "gateway": "running" if gateway_thread and gateway_thread.is_alive() else "stopped",
         "uptime_seconds": int(time.time() - start_time),
     }
+
+
+@app.get("/health")
+def api_health():
+    uptime_seconds.set(int(time.time() - start_time))
+    result = run_health_checks(mqtt_cfg.host, mqtt_cfg.port, db_cfg.uri)
+    result["uptime_seconds"] = int(time.time() - start_time)
+    return result
+
+
+@app.get("/metrics")
+def api_metrics():
+    uptime_seconds.set(int(time.time() - start_time))
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/api/machines")
@@ -269,6 +396,7 @@ def api_ack_alarm(alarm_id: int):
     for alarm in alarms:
         if alarm["id"] == alarm_id:
             alarm["acknowledged"] = True
+            alarm_active.set(sum(1 for a in alarms if not a["acknowledged"]))
             return {"ok": True}
     return {"ok": False, "error": "Alarm not found"}
 
@@ -1437,6 +1565,11 @@ HTML = """
     <button class="nav-tab" data-tab="control">Kontrol Paneli</button>
     <button class="nav-tab" data-tab="alarms">Alarmlar</button>
     <button class="nav-tab" data-tab="rag">RAG Asistan</button>
+    <button class="nav-tab" data-tab="packml">Durum Makinesi</button>
+    <button class="nav-tab" data-tab="twin">Dijital Ikiz</button>
+    <button class="nav-tab" data-tab="spc">SPC</button>
+    <button class="nav-tab" data-tab="cm">Durum Izleme</button>
+    <button class="nav-tab" data-tab="energy">Enerji</button>
 </nav>
 <nav class="nav-tabs nav-tabs-erp" id="nav-erp">
     <button class="nav-tab active" data-tab="erp-dashboard">KPI Dashboard</button>
@@ -1446,6 +1579,10 @@ HTML = """
     <button class="nav-tab" data-tab="erp-orders">Siparisler</button>
     <button class="nav-tab" data-tab="erp-predict">Hata Tahmini</button>
     <button class="nav-tab" data-tab="erp-analytics">Analitik</button>
+    <button class="nav-tab" data-tab="mes-orders">Uretim Emirleri</button>
+    <button class="nav-tab" data-tab="mes-recipes">Recete Yonetimi</button>
+    <button class="nav-tab" data-tab="trace">Izlenebilirlik</button>
+    <button class="nav-tab" data-tab="edge">Edge</button>
 </nav>
 
 <main class="main-content">
@@ -1517,10 +1654,18 @@ HTML = """
         <div class="control-panel">
             <div class="control-card">
                 <h3>Sistem Kontrolu</h3>
+                <div style="margin-bottom: 12px;">
+                    <label style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 6px; display: block;">Veri Kaynagi</label>
+                    <div style="display: flex; gap: 6px;">
+                        <button class="btn btn-primary" id="btn-start-sim" onclick="SmartFactory.startSystem()" style="flex:1;">
+                            <span>&#9654;</span> Simulasyon
+                        </button>
+                        <button class="btn btn-secondary" id="btn-start-gw" onclick="SmartFactory.startGateway()" style="flex:1; background: #1a6b3c; border-color: #1a6b3c;">
+                            <span>&#9654;</span> TwinCAT
+                        </button>
+                    </div>
+                </div>
                 <div class="control-buttons">
-                    <button class="btn btn-primary" onclick="SmartFactory.startSystem()">
-                        <span>&#9654;</span> Baslat
-                    </button>
                     <button class="btn btn-secondary" onclick="SmartFactory.refreshAll()">
                         <span>&#8635;</span> Yenile
                     </button>
@@ -1535,12 +1680,31 @@ HTML = """
                         <span class="value"><div class="status-dot stopped" id="status-sim"></div> <span id="status-sim-text">Stopped</span></span>
                     </div>
                     <div class="status-row">
+                        <span class="label">TwinCAT Gateway</span>
+                        <span class="value"><div class="status-dot stopped" id="status-gateway"></div> <span id="status-gateway-text">Stopped</span></span>
+                    </div>
+                    <div class="status-row">
                         <span class="label">Consumer</span>
                         <span class="value"><div class="status-dot stopped" id="status-consumer"></div> <span id="status-consumer-text">Stopped</span></span>
                     </div>
                     <div class="status-row">
                         <span class="label">Listener</span>
                         <span class="value"><div class="status-dot stopped" id="status-listener"></div> <span id="status-listener-text">Stopped</span></span>
+                    </div>
+                </div>
+                <h3 style="margin-top:16px;">Saglik Kontrolleri</h3>
+                <div class="status-list" id="health-status-list">
+                    <div class="status-row">
+                        <span class="label">MQTT Broker</span>
+                        <span class="value"><div class="status-dot stopped" id="health-mqtt"></div> <span id="health-mqtt-text">--</span></span>
+                    </div>
+                    <div class="status-row">
+                        <span class="label">PostgreSQL</span>
+                        <span class="value"><div class="status-dot stopped" id="health-pg"></div> <span id="health-pg-text">--</span></span>
+                    </div>
+                    <div class="status-row">
+                        <span class="label">VectorStore</span>
+                        <span class="value"><div class="status-dot stopped" id="health-vs"></div> <span id="health-vs-text">--</span></span>
                     </div>
                 </div>
             </div>
@@ -1708,6 +1872,221 @@ HTML = """
                             <span class="value" id="rag-status-docs">-</span>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- PackML State Machine Tab -->
+    <div class="tab-content" id="tab-packml">
+        <div class="control-panel">
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#9881; PackML Durum Makinesi (ISA-TR88)</h3>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
+                    ISA-TR88.00.02 standardina uygun makine durum yonetimi. Gecis komutlari gonderin, durum gecmisini izleyin.
+                </p>
+                <div style="display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;">
+                    <select id="packml-machine-select" style="padding: 10px 16px; background: var(--bg-primary);
+                        border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); font-size: 14px;">
+                        <option value="MX100">MX100 - Line1</option>
+                        <option value="MX200">MX200 - Line2</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- State Diagram SVG -->
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>Durum Diyagrami</h3>
+                <div id="packml-diagram" style="width:100%; overflow-x:auto; min-height: 420px; background: var(--bg-primary); border-radius: 8px; padding: 12px;">
+                    <svg id="packml-svg" viewBox="0 0 800 400" style="width:100%; height:400px;"></svg>
+                </div>
+            </div>
+
+            <!-- Command Buttons & Current State -->
+            <div class="control-card">
+                <h3>Mevcut Durum</h3>
+                <div style="text-align:center; margin: 16px 0;">
+                    <div id="packml-current-state" style="font-size: 28px; font-weight: 700; color: var(--accent-cyan);">Stopped</div>
+                    <div id="packml-state-duration" style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">0s</div>
+                </div>
+                <h4 style="margin-top: 16px; color: var(--text-secondary);">Komutlar</h4>
+                <div id="packml-commands" style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px;"></div>
+            </div>
+
+            <!-- Transition History -->
+            <div class="control-card">
+                <h3>Gecis Gecmisi</h3>
+                <div id="packml-history" style="max-height: 350px; overflow-y: auto;">
+                    <div style="color: var(--text-muted); text-align: center; padding: 16px;">Gecis yok</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Digital Twin Tab -->
+    <div class="tab-content" id="tab-twin">
+        <div class="control-panel">
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#127981; Dijital Ikiz — Davranis Modeli</h3>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
+                    Fizik tabanli model ile gercek sensor verilerini karsilastirin. %15+ sapma anomali uyarisi olusturur.
+                </p>
+                <div style="display: flex; gap: 12px; margin-bottom: 16px;">
+                    <select id="twin-machine-select" style="padding: 10px 16px; background: var(--bg-primary);
+                        border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="MX100">MX100 - Line1</option>
+                        <option value="MX200">MX200 - Line2</option>
+                    </select>
+                    <button class="btn btn-secondary" onclick="SmartFactory.twinCalibrate()">Kalibre Et</button>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Saglik Skoru</h3>
+                <div style="text-align:center; margin:16px 0;">
+                    <div id="twin-health-score" style="font-size:48px; font-weight:700; color:var(--accent-cyan);">--</div>
+                    <div style="color:var(--text-muted); font-size:13px;">/ 100</div>
+                    <div id="twin-runtime" style="color:var(--text-muted); font-size:12px; margin-top:4px;">Calisma: --</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Sensor Karsilastirmasi</h3>
+                <div id="twin-comparison" style="font-size:13px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Veri bekleniyor...</div>
+                </div>
+            </div>
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>Aktif Sapmalar</h3>
+                <div id="twin-deviations" style="font-size:13px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Sapma yok</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- SPC Tab -->
+    <div class="tab-content" id="tab-spc">
+        <div class="control-panel">
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#128200; SPC — Istatistiksel Proses Kontrol</h3>
+                <div style="display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;">
+                    <select id="spc-machine-select" style="padding: 10px 16px; background: var(--bg-primary);
+                        border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="MX100">MX100</option>
+                        <option value="MX200">MX200</option>
+                    </select>
+                    <select id="spc-sensor-select" style="padding: 10px 16px; background: var(--bg-primary);
+                        border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="temperature">Sicaklik</option>
+                        <option value="vibration">Titresim</option>
+                        <option value="current">Akim</option>
+                    </select>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>X-bar Kontrol Grafigi</h3>
+                <canvas id="spc-xbar-canvas" style="width:100%; height:200px; background:var(--bg-primary); border-radius:8px;"></canvas>
+            </div>
+            <div class="control-card">
+                <h3>R Kontrol Grafigi</h3>
+                <canvas id="spc-r-canvas" style="width:100%; height:200px; background:var(--bg-primary); border-radius:8px;"></canvas>
+            </div>
+            <div class="control-card">
+                <h3>Proses Yeterliligi</h3>
+                <div id="spc-capability" style="display:flex; gap:16px; flex-wrap:wrap; justify-content:center; padding:16px;">
+                    <div style="text-align:center;"><div style="font-size:24px; font-weight:700;" id="spc-cp">--</div><div style="color:var(--text-muted); font-size:12px;">Cp</div></div>
+                    <div style="text-align:center;"><div style="font-size:24px; font-weight:700;" id="spc-cpk">--</div><div style="color:var(--text-muted); font-size:12px;">Cpk</div></div>
+                    <div style="text-align:center;"><div style="font-size:24px; font-weight:700;" id="spc-mean">--</div><div style="color:var(--text-muted); font-size:12px;">Ortalama</div></div>
+                    <div style="text-align:center;"><div style="font-size:24px; font-weight:700;" id="spc-sigma">--</div><div style="color:var(--text-muted); font-size:12px;">Sigma</div></div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Nelson Kural Ihlalleri</h3>
+                <div id="spc-violations" style="font-size:13px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Ihlal yok</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Condition Monitoring Tab -->
+    <div class="tab-content" id="tab-cm">
+        <div class="control-panel">
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#128295; Durum Izleme — ISO 10816 & Yatak Analizi</h3>
+                <div style="display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;">
+                    <select id="cm-machine-select" style="padding: 10px 16px; background: var(--bg-primary);
+                        border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="MX100">MX100</option>
+                        <option value="MX200">MX200</option>
+                    </select>
+                    <select id="cm-defect-select" style="padding: 10px 16px; background: var(--bg-primary);
+                        border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary);">
+                        <option value="">Normal (Ariza Yok)</option>
+                        <option value="outer">Dis Bilezik Arizasi</option>
+                        <option value="inner">Ic Bilezik Arizasi</option>
+                        <option value="ball">Bilye Arizasi</option>
+                        <option value="cage">Kafes Arizasi</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="SmartFactory.cmRefresh()">Analiz Et</button>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>FFT Spektrumu</h3>
+                <canvas id="cm-fft-canvas" style="width:100%; height:220px; background:var(--bg-primary); border-radius:8px;"></canvas>
+            </div>
+            <div class="control-card">
+                <h3>ISO 10816 Bolgesi</h3>
+                <div id="cm-iso-zone" style="text-align:center; padding:16px;">
+                    <div id="cm-zone-letter" style="font-size:48px; font-weight:700; color:var(--accent-cyan);">--</div>
+                    <div id="cm-zone-label" style="color:var(--text-muted);">--</div>
+                    <div id="cm-rms" style="color:var(--text-secondary); font-size:13px; margin-top:8px;">RMS: -- mm/s</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Yatak Ariza Frekanslari</h3>
+                <div id="cm-bearing-freqs" style="font-size:13px; padding:8px;">
+                    <div style="color:var(--text-muted); text-align:center;">Analiz bekleniyor...</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Kalan Faydali Omur (RUL)</h3>
+                <div id="cm-rul" style="text-align:center; padding:16px;">
+                    <div id="cm-rul-hours" style="font-size:32px; font-weight:700; color:var(--accent-cyan);">--</div>
+                    <div style="color:var(--text-muted); font-size:12px;">saat</div>
+                    <div id="cm-rul-confidence" style="color:var(--text-secondary); font-size:13px; margin-top:4px;">Guven: --%</div>
+                    <div id="cm-rul-trend" style="color:var(--text-muted); font-size:12px; margin-top:4px;">--</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Energy Monitoring Tab -->
+    <div class="tab-content" id="tab-energy">
+        <div class="control-panel">
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#9889; Enerji Izleme — ISO 50001</h3>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
+                    Makine basi guc tuketimi, kWh/parca verimi ve CO2 emisyon takibi.
+                </p>
+            </div>
+            <div class="control-card">
+                <h3>Anlik Guc</h3>
+                <div id="energy-realtime" style="font-size:13px; padding:8px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Veri bekleniyor...</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Enerji Verimliligi</h3>
+                <div id="energy-efficiency" style="display:flex; gap:16px; flex-wrap:wrap; justify-content:center; padding:16px;">
+                    <div style="text-align:center;"><div style="font-size:24px; font-weight:700;" id="energy-total-kwh">--</div><div style="color:var(--text-muted); font-size:12px;">Toplam kWh</div></div>
+                    <div style="text-align:center;"><div style="font-size:24px; font-weight:700;" id="energy-kwh-part">--</div><div style="color:var(--text-muted); font-size:12px;">kWh/parca</div></div>
+                    <div style="text-align:center;"><div style="font-size:24px; font-weight:700;" id="energy-co2">--</div><div style="color:var(--text-muted); font-size:12px;">CO2 (kg)</div></div>
+                </div>
+            </div>
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>Makine Detay</h3>
+                <div id="energy-machines" style="font-size:13px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Veri bekleniyor...</div>
                 </div>
             </div>
         </div>
@@ -2041,6 +2420,135 @@ HTML = """
             </div>
         </div>
     </div>
+
+    <!-- MES Work Orders Tab -->
+    <div class="tab-content" id="tab-mes-orders">
+        <div class="control-panel">
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#128221; Uretim Emirleri (MES)</h3>
+                <div style="display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;">
+                    <button class="btn btn-primary" onclick="SmartFactory.mesShowCreateForm()">+ Yeni Emir</button>
+                    <button class="btn btn-secondary" onclick="SmartFactory.mesRefresh()">&#8635; Yenile</button>
+                </div>
+                <div id="mes-create-form" style="display:none; background:var(--bg-primary); padding:16px; border-radius:8px; margin-bottom:16px;">
+                    <div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); gap:12px;">
+                        <input id="mes-product" placeholder="Urun Kodu" style="padding:10px; background:var(--bg-tertiary); border:1px solid var(--border-color); border-radius:6px; color:var(--text-primary);">
+                        <select id="mes-machine" style="padding:10px; background:var(--bg-tertiary); border:1px solid var(--border-color); border-radius:6px; color:var(--text-primary);">
+                            <option value="MX100">MX100</option><option value="MX200">MX200</option>
+                        </select>
+                        <input id="mes-qty" type="number" placeholder="Hedef Adet" style="padding:10px; background:var(--bg-tertiary); border:1px solid var(--border-color); border-radius:6px; color:var(--text-primary);">
+                        <button class="btn btn-primary" onclick="SmartFactory.mesCreateOrder()">Olustur</button>
+                    </div>
+                </div>
+            </div>
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>Emir Listesi</h3>
+                <div id="mes-orders-list" style="overflow-x:auto; font-size:13px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Yukleniyor...</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Vardiya Raporu</h3>
+                <div id="mes-shift-report" style="font-size:13px; padding:8px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Veri bekleniyor...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recipe Management Tab -->
+    <div class="tab-content" id="tab-mes-recipes">
+        <div class="control-panel">
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#128214; Recete Yonetimi (ISA-88)</h3>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
+                    Urun recetelerini yonetin. Parametre setleri, versiyon kontrolu ve audit trail.
+                </p>
+            </div>
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>Recete Listesi</h3>
+                <div id="mes-recipes-list" style="overflow-x:auto; font-size:13px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Yukleniyor...</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Recete Detay</h3>
+                <div id="mes-recipe-detail" style="font-size:13px; padding:8px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Bir recete secin</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Audit Log</h3>
+                <div id="mes-recipe-audit" style="font-size:13px; max-height:300px; overflow-y:auto;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">--</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Traceability Tab -->
+    <div class="tab-content" id="tab-trace">
+        <div class="control-panel">
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#128270; Izlenebilirlik — IATF 16949</h3>
+                <div style="display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;">
+                    <input id="trace-search" placeholder="DMC kodu veya batch numarasi" style="flex:1; min-width:200px; padding:10px 16px; background:var(--bg-primary);
+                        border:1px solid var(--border-color); border-radius:8px; color:var(--text-primary);"
+                        onkeypress="if(event.key==='Enter') SmartFactory.traceSearch()">
+                    <button class="btn btn-primary" onclick="SmartFactory.traceSearch()">Ara</button>
+                </div>
+            </div>
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>Parca Listesi</h3>
+                <div id="trace-parts-list" style="overflow-x:auto; font-size:13px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Arama yapin veya parcalar yuklenecek...</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Parca Detay</h3>
+                <div id="trace-detail" style="font-size:13px; padding:8px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Bir parca secin</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Istatistikler</h3>
+                <div id="trace-stats" style="font-size:13px; padding:8px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">--</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edge Computing Tab -->
+    <div class="tab-content" id="tab-edge">
+        <div class="control-panel">
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>&#127760; Edge Computing</h3>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
+                    Store-and-forward buffer yonetimi ve edge rule engine.
+                </p>
+            </div>
+            <div class="control-card">
+                <h3>Edge Durumu</h3>
+                <div id="edge-status" style="font-size:13px; padding:8px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Yukleniyor...</div>
+                </div>
+            </div>
+            <div class="control-card">
+                <h3>Buffer Istatistikleri</h3>
+                <div id="edge-buffer" style="font-size:13px; padding:8px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">--</div>
+                </div>
+                <button class="btn btn-secondary" onclick="SmartFactory.edgeSync()" style="margin-top:8px;">Senkronize Et</button>
+            </div>
+            <div class="control-card" style="grid-column: 1 / -1;">
+                <h3>Edge Kurallari</h3>
+                <div id="edge-rules-list" style="overflow-x:auto; font-size:13px;">
+                    <div style="color:var(--text-muted); text-align:center; padding:16px;">Yukleniyor...</div>
+                </div>
+            </div>
+        </div>
+    </div>
 </main>
 
 <footer class="footer">
@@ -2050,7 +2558,7 @@ HTML = """
         <span>|</span>
         <span id="footer-update">Son guncelleme: --:--:--</span>
     </div>
-    <div>SmartFact v1.2 - Industry 4.0 IoT Platform</div>
+    <div>SmartFact v2.0 - Industry 4.0 IoT Platform | PackML | OPC UA | Digital Twin | MES | SPC | ISO 10816 | ISO 50001 | Edge</div>
 </footer>
 """
 
@@ -2103,8 +2611,11 @@ const SmartFactory = (function() {
         getKPIs: () => API.get('/api/kpis'),
         getAlarms: () => API.get('/api/alarms'),
         getSystemStatus: () => API.get('/api/system/status'),
+        getHealth: () => API.get('/health'),
         getMessages: () => API.get('/api/messages'),
         startSystem: () => API.post('/api/system/start'),
+        startGateway: () => API.post('/api/system/start-gateway'),
+        stopGateway: () => API.post('/api/system/stop-gateway'),
         ackAlarm: (id) => API.post(`/api/alarms/${id}/ack`)
     };
 
@@ -2323,8 +2834,31 @@ const SmartFactory = (function() {
 
         updateDot('status-broker', s.broker);
         updateDot('status-sim', s.simulation);
+        updateDot('status-gateway', s.gateway);
         updateDot('status-consumer', s.consumer);
         updateDot('status-listener', s.listener);
+
+        // Highlight active source button
+        const btnSim = document.getElementById('btn-start-sim');
+        const btnGw = document.getElementById('btn-start-gw');
+        if (btnSim && btnGw) {
+            if (s.gateway === 'running') {
+                btnGw.style.opacity = '1';
+                btnGw.style.boxShadow = '0 0 8px #1a6b3c';
+                btnSim.style.opacity = '0.5';
+                btnSim.style.boxShadow = 'none';
+            } else if (s.simulation === 'running') {
+                btnSim.style.opacity = '1';
+                btnSim.style.boxShadow = '0 0 8px var(--primary)';
+                btnGw.style.opacity = '0.5';
+                btnGw.style.boxShadow = 'none';
+            } else {
+                btnSim.style.opacity = '1';
+                btnSim.style.boxShadow = 'none';
+                btnGw.style.opacity = '1';
+                btnGw.style.boxShadow = 'none';
+            }
+        }
 
         const uptime = document.getElementById('kpi-uptime');
         if (uptime && s.uptime_seconds) {
@@ -2336,7 +2870,7 @@ const SmartFactory = (function() {
         const footerDot = document.getElementById('footer-dot');
         const footerStatus = document.getElementById('footer-status');
 
-        const isConnected = s.simulation === 'running';
+        const isConnected = s.simulation === 'running' || s.gateway === 'running';
         if (connDot) connDot.className = 'status-dot ' + (isConnected ? '' : 'stopped');
         if (connText) connText.textContent = isConnected ? 'Connected' : 'Disconnected';
         if (footerDot) footerDot.className = 'status-dot ' + (isConnected ? '' : 'stopped');
@@ -2486,6 +3020,26 @@ const SmartFactory = (function() {
         }
     }
 
+    async function updateHealth() {
+        const data = await API.getHealth();
+        if (data && data.checks) {
+            const updateHealthDot = (id, check) => {
+                const dot = document.getElementById(id);
+                const text = document.getElementById(id + '-text');
+                if (dot) dot.className = 'status-dot ' + (check.status === 'up' ? '' : 'stopped');
+                if (text) {
+                    let label = check.status === 'up' ? 'Healthy' : 'Down';
+                    if (check.latency_ms) label += ' (' + check.latency_ms + 'ms)';
+                    if (check.total_chunks !== undefined) label += ' (' + check.total_chunks + ' chunks)';
+                    text.textContent = label;
+                }
+            };
+            updateHealthDot('health-mqtt', data.checks.mqtt_broker);
+            updateHealthDot('health-pg', data.checks.postgres);
+            updateHealthDot('health-vs', data.checks.vector_store);
+        }
+    }
+
     function updateClock() {
         const clock = document.getElementById('clock');
         const footerUpdate = document.getElementById('footer-update');
@@ -2501,6 +3055,12 @@ const SmartFactory = (function() {
         await updateMachines();
     }
 
+    async function startGateway() {
+        await API.startGateway();
+        await updateSystemStatus();
+        await updateMachines();
+    }
+
     async function ackAlarm(id) {
         await API.ackAlarm(id);
         await updateAlarms();
@@ -2512,7 +3072,8 @@ const SmartFactory = (function() {
             updateKPIs(),
             updateAlarms(),
             updateSystemStatus(),
-            updateMessages()
+            updateMessages(),
+            updateHealth()
         ]);
     }
 
@@ -2528,9 +3089,20 @@ const SmartFactory = (function() {
                 document.getElementById(tabId)?.classList.add('active');
                 state.activeTab = tab.dataset.tab;
 
-                if (tab.dataset.tab === 'machines') {
-                    setTimeout(drawChart, 100);
-                }
+                if (tab.dataset.tab === 'machines') setTimeout(drawChart, 100);
+
+                // PackML polling
+                if (tab.dataset.tab === 'packml') startPackMLPolling();
+                else stopPackMLPolling();
+
+                // Lazy-load data for newly activated tabs
+                const lazyLoaders = {
+                    'twin': updateTwin, 'spc': updateSPC, 'cm': cmRefresh,
+                    'energy': updateEnergy, 'mes-orders': mesRefresh,
+                    'mes-recipes': mesLoadRecipes, 'trace': traceSearch, 'edge': updateEdge
+                };
+                const loader = lazyLoaders[tab.dataset.tab];
+                if (loader) setTimeout(loader, 50);
             });
         });
     }
@@ -2551,6 +3123,7 @@ const SmartFactory = (function() {
         setInterval(updateKPIs, CONFIG.KPI_INTERVAL);
         setInterval(updateAlarms, CONFIG.ALARM_INTERVAL);
         setInterval(updateSystemStatus, 3000);
+        setInterval(updateHealth, 10000);
         setInterval(updateMessages, 2000);
 
         // Resize handler for chart
@@ -2558,7 +3131,19 @@ const SmartFactory = (function() {
             setTimeout(drawChart, 100);
         });
 
-        console.log('SmartFactory Dashboard initialized');
+        // Select change listeners for new modules
+        const selectListeners = [
+            ['packml-machine-select', updatePackML],
+            ['twin-machine-select', updateTwin],
+            ['spc-machine-select', updateSPC],
+            ['spc-sensor-select', updateSPC],
+        ];
+        selectListeners.forEach(([id, fn]) => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('change', fn);
+        });
+
+        console.log('SmartFactory Dashboard v2.0 initialized');
     }
 
     // ─── RAG Functions ─────────────────────────────────────
@@ -2776,6 +3361,14 @@ const SmartFactory = (function() {
                         drawTemperatureCurveChart();
                     }, 100);
                 }
+
+                // Lazy-load for new ERP tabs
+                const erpLoaders = {
+                    'mes-orders': mesRefresh, 'mes-recipes': mesLoadRecipes,
+                    'trace': traceSearch, 'edge': updateEdge
+                };
+                const loader = erpLoaders[tab.dataset.tab];
+                if (loader) setTimeout(loader, 50);
             });
         });
     }
@@ -3362,9 +3955,738 @@ const SmartFactory = (function() {
         ]);
     }
 
+    // ─── PackML State Machine ─────────────────────────────────────
+
+    const PACKML_COLORS = {
+        'Idle': '#3b82f6', 'Starting': '#f59e0b', 'Execute': '#22c55e',
+        'Completing': '#f59e0b', 'Complete': '#06b6d4', 'Holding': '#f59e0b',
+        'Held': '#ef4444', 'Unholding': '#f59e0b', 'Stopping': '#f59e0b',
+        'Stopped': '#6b7280', 'Aborting': '#dc2626', 'Aborted': '#dc2626',
+        'Clearing': '#f59e0b', 'Resetting': '#f59e0b', 'Suspended': '#a855f7',
+        'Unsuspending': '#f59e0b', 'Undefined': '#374151'
+    };
+    const PACKML_CMD_COLORS = {
+        'Start': '#22c55e', 'Stop': '#ef4444', 'Hold': '#f59e0b',
+        'Unhold': '#3b82f6', 'Abort': '#dc2626', 'Clear': '#06b6d4',
+        'Reset': '#8b5cf6', 'Complete': '#06b6d4', 'Suspend': '#a855f7',
+        'Unsuspend': '#3b82f6'
+    };
+
+    async function packmlSendCommand(cmd) {
+        const machine = document.getElementById('packml-machine-select').value;
+        try {
+            const res = await fetch('/api/packml/command', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({machine_code: machine, command: cmd, triggered_by: 'operator'})
+            });
+            const data = await res.json();
+            if (!data.ok) {
+                console.warn('PackML command rejected:', data.message);
+            }
+            updatePackML();
+        } catch(e) { console.error('PackML command error:', e); }
+    }
+
+    async function updatePackML() {
+        const machine = document.getElementById('packml-machine-select')?.value;
+        if (!machine) return;
+        try {
+            const [stateRes, histRes] = await Promise.all([
+                fetch('/api/packml/states/' + machine),
+                fetch('/api/packml/history/' + machine + '?limit=30')
+            ]);
+            const stateData = await stateRes.json();
+            const histData = await histRes.json();
+
+            // Update current state display
+            const stEl = document.getElementById('packml-current-state');
+            if (stEl) {
+                stEl.textContent = stateData.state;
+                stEl.style.color = PACKML_COLORS[stateData.state] || '#fff';
+            }
+            const durEl = document.getElementById('packml-state-duration');
+            if (durEl) durEl.textContent = stateData.state_duration + 's';
+
+            // Update command buttons
+            const cmdDiv = document.getElementById('packml-commands');
+            if (cmdDiv) {
+                cmdDiv.innerHTML = (stateData.allowed_commands || []).map(cmd =>
+                    '<button class="btn btn-secondary" onclick="SmartFactory.packmlSendCommand(\\'' + cmd + '\\')" ' +
+                    'style="background:' + (PACKML_CMD_COLORS[cmd] || '#444') + '; border-color:' + (PACKML_CMD_COLORS[cmd] || '#444') + '; min-width: 80px;">' +
+                    cmd + '</button>'
+                ).join('');
+                if (!stateData.allowed_commands || stateData.allowed_commands.length === 0) {
+                    cmdDiv.innerHTML = '<span style="color:var(--text-muted);">Otomatik gecis bekleniyor...</span>';
+                }
+            }
+
+            // Draw SVG state diagram
+            drawPackMLDiagram(stateData.diagram);
+
+            // Update history
+            const histDiv = document.getElementById('packml-history');
+            if (histDiv && histData.transitions) {
+                if (histData.transitions.length === 0) {
+                    histDiv.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:16px;">Gecis yok</div>';
+                } else {
+                    histDiv.innerHTML = histData.transitions.map(t => {
+                        const dt = new Date(t.timestamp * 1000);
+                        const timeStr = dt.toLocaleTimeString('tr-TR');
+                        return '<div style="display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border-bottom:1px solid var(--border-color); font-size:13px;">' +
+                            '<span style="color:' + (PACKML_COLORS[t.from_state] || '#888') + ';">' + t.from_state + '</span>' +
+                            '<span style="color:var(--text-muted);">&#8594;</span>' +
+                            '<span style="color:' + (PACKML_COLORS[t.to_state] || '#888') + ';">' + t.to_state + '</span>' +
+                            '<span style="color:var(--text-secondary); font-size:11px;">' + t.command + ' (' + t.triggered_by + ')</span>' +
+                            '<span style="color:var(--text-muted); font-size:11px;">' + timeStr + '</span>' +
+                        '</div>';
+                    }).join('');
+                }
+            }
+        } catch(e) { console.error('PackML update error:', e); }
+    }
+
+    function drawPackMLDiagram(diagram) {
+        const svg = document.getElementById('packml-svg');
+        if (!svg || !diagram) return;
+
+        let html = '';
+        // Draw edges first (under nodes)
+        (diagram.edges || []).forEach(e => {
+            const fromSt = (diagram.states || []).find(s => s.name === e.from);
+            const toSt = (diagram.states || []).find(s => s.name === e.to);
+            if (!fromSt || !toSt) return;
+            const x1 = fromSt.x + 55, y1 = fromSt.y + 18;
+            const x2 = toSt.x + 55, y2 = toSt.y + 18;
+            const color = e.active ? '#22c55e' : '#334155';
+            const width = e.active ? 2.5 : 1;
+            const opacity = e.active ? 1 : 0.4;
+            html += '<line x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '" ' +
+                'stroke="' + color + '" stroke-width="' + width + '" opacity="' + opacity + '" ' +
+                'marker-end="url(#arrowhead)"/>';
+        });
+
+        // Draw nodes
+        (diagram.states || []).forEach(s => {
+            const fill = s.is_current ? (PACKML_COLORS[s.name] || '#3b82f6') : '#1e293b';
+            const stroke = s.is_current ? '#fff' : (PACKML_COLORS[s.name] || '#475569');
+            const strokeW = s.is_current ? 2.5 : 1;
+            const textColor = s.is_current ? '#fff' : '#94a3b8';
+            const rx = s.is_transient ? 18 : 6;
+            html += '<rect x="' + s.x + '" y="' + s.y + '" width="110" height="36" rx="' + rx + '" ' +
+                'fill="' + fill + '" stroke="' + stroke + '" stroke-width="' + strokeW + '"/>';
+            html += '<text x="' + (s.x + 55) + '" y="' + (s.y + 22) + '" text-anchor="middle" ' +
+                'fill="' + textColor + '" font-size="11" font-weight="' + (s.is_current ? '700' : '400') + '">' +
+                s.name + '</text>';
+        });
+
+        // Arrow marker definition
+        const defs = '<defs><marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">' +
+            '<polygon points="0 0, 8 3, 0 6" fill="#475569"/></marker></defs>';
+
+        svg.innerHTML = defs + html;
+    }
+
+    // PackML polling — only when tab is active
+    let packmlInterval = null;
+    function startPackMLPolling() {
+        if (!packmlInterval) {
+            updatePackML();
+            packmlInterval = setInterval(updatePackML, 2000);
+        }
+    }
+    function stopPackMLPolling() {
+        if (packmlInterval) { clearInterval(packmlInterval); packmlInterval = null; }
+    }
+
+    // (tab-aware polling is handled in the DOMContentLoaded block below)
+
+    // ─── Digital Twin ─────────────────────────────────────────────
+
+    async function updateTwin() {
+        const machine = document.getElementById('twin-machine-select')?.value || 'MX100';
+        try {
+            const res = await fetch('/api/twin/' + machine + '/status');
+            const data = await res.json();
+            const scoreEl = document.getElementById('twin-health-score');
+            if (scoreEl) {
+                const score = data.health_score || 0;
+                scoreEl.textContent = score;
+                scoreEl.style.color = score > 80 ? '#22c55e' : score > 50 ? '#f59e0b' : '#ef4444';
+            }
+            const rtEl = document.getElementById('twin-runtime');
+            if (rtEl) rtEl.textContent = 'Calisma: ' + (data.runtime_minutes || 0) + ' dk';
+
+            // Comparison
+            const compRes = await fetch('/api/twin/' + machine + '/status');
+            const compData = await compRes.json();
+            const compDiv = document.getElementById('twin-comparison');
+            const devs = compData.active_deviations || [];
+            if (compDiv) {
+                if (devs.length === 0) {
+                    compDiv.innerHTML = '<div style="color:#22c55e; text-align:center; padding:16px;">Tum sensorler normal</div>';
+                } else {
+                    compDiv.innerHTML = devs.map(d => {
+                        const color = d.severity === 'anomaly' ? '#ef4444' : d.severity === 'warning' ? '#f59e0b' : '#22c55e';
+                        return '<div style="display:flex; justify-content:space-between; padding:8px; border-bottom:1px solid var(--border-color);">' +
+                            '<span>' + d.sensor + '</span>' +
+                            '<span>Beklenen: ' + d.expected + '</span>' +
+                            '<span>Gercek: ' + d.actual + '</span>' +
+                            '<span style="color:' + color + '; font-weight:700;">%' + d.deviation_pct + '</span>' +
+                        '</div>';
+                    }).join('');
+                }
+            }
+
+            // Active deviations
+            const devDiv = document.getElementById('twin-deviations');
+            if (devDiv) {
+                if (devs.length === 0) {
+                    devDiv.innerHTML = '<div style="color:#22c55e; text-align:center; padding:16px;">Sapma yok - sistem normal</div>';
+                } else {
+                    devDiv.innerHTML = devs.map(d => {
+                        const color = d.severity === 'anomaly' ? '#ef4444' : '#f59e0b';
+                        const badge = d.severity === 'anomaly' ? 'ANOMALI' : 'UYARI';
+                        return '<div style="display:flex; justify-content:space-between; align-items:center; padding:10px; margin:4px 0; background:var(--bg-primary); border-radius:6px; border-left:3px solid ' + color + ';">' +
+                            '<span style="color:' + color + '; font-weight:600;">[' + badge + '] ' + d.sensor + '</span>' +
+                            '<span>Sapma: %' + d.deviation_pct + '</span>' +
+                        '</div>';
+                    }).join('');
+                }
+            }
+        } catch(e) { console.error('Twin update error:', e); }
+    }
+
+    async function twinCalibrate() {
+        const machine = document.getElementById('twin-machine-select')?.value || 'MX100';
+        await fetch('/api/twin/calibrate/' + machine, {method:'POST'});
+        updateTwin();
+    }
+
+    // ─── SPC ──────────────────────────────────────────────────────
+
+    async function updateSPC() {
+        const machine = document.getElementById('spc-machine-select')?.value || 'MX100';
+        const sensor = document.getElementById('spc-sensor-select')?.value || 'temperature';
+        try {
+            const [chartRes, capRes, violRes] = await Promise.all([
+                fetch('/api/spc/chart/' + machine + '/' + sensor),
+                fetch('/api/spc/capability/' + machine + '/' + sensor),
+                fetch('/api/spc/violations/' + machine),
+            ]);
+            const chartData = await chartRes.json();
+            const capData = await capRes.json();
+            const violData = await violRes.json();
+
+            // Draw X-bar chart
+            drawSPCChart('spc-xbar-canvas', chartData.xbar, 'X-bar');
+            drawSPCChart('spc-r-canvas', chartData.r_chart, 'R');
+
+            // Capability
+            const cpEl = document.getElementById('spc-cp');
+            const cpkEl = document.getElementById('spc-cpk');
+            const meanEl = document.getElementById('spc-mean');
+            const sigmaEl = document.getElementById('spc-sigma');
+            if (cpEl) { cpEl.textContent = capData.cp || '--'; cpEl.style.color = (capData.cp > 1.33) ? '#22c55e' : (capData.cp > 1.0) ? '#f59e0b' : '#ef4444'; }
+            if (cpkEl) { cpkEl.textContent = capData.cpk || '--'; cpkEl.style.color = (capData.cpk > 1.33) ? '#22c55e' : (capData.cpk > 1.0) ? '#f59e0b' : '#ef4444'; }
+            if (meanEl) meanEl.textContent = capData.mean || '--';
+            if (sigmaEl) sigmaEl.textContent = capData.sigma || '--';
+
+            // Violations
+            const violDiv = document.getElementById('spc-violations');
+            if (violDiv) {
+                const viols = violData.violations || {};
+                const allViols = Object.entries(viols).flatMap(([s, v]) => v.map(x => ({...x, sensor: s})));
+                if (allViols.length === 0) {
+                    violDiv.innerHTML = '<div style="color:#22c55e; text-align:center; padding:16px;">Nelson kural ihlali yok</div>';
+                } else {
+                    violDiv.innerHTML = allViols.map(v =>
+                        '<div style="padding:8px; margin:4px 0; background:var(--bg-primary); border-radius:6px; border-left:3px solid #ef4444;">' +
+                        '<span style="color:#ef4444; font-weight:600;">Kural ' + v.rule + '</span> — ' + v.description +
+                        ' <span style="color:var(--text-muted);">(' + (v.sensor || sensor) + ')</span></div>'
+                    ).join('');
+                }
+            }
+        } catch(e) { console.error('SPC update error:', e); }
+    }
+
+    function drawSPCChart(canvasId, data, title) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !data || !data.values || data.values.length === 0) return;
+        const ctx = canvas.getContext('2d');
+        const W = canvas.parentElement.clientWidth - 24;
+        const H = 200;
+        canvas.width = W; canvas.height = H;
+        ctx.clearRect(0, 0, W, H);
+
+        const vals = data.values;
+        const ucl = data.ucl, lcl = data.lcl, cl = data.cl;
+        const allVals = [...vals, ucl, lcl, cl].filter(v => v !== undefined);
+        const minV = Math.min(...allVals) - 1;
+        const maxV = Math.max(...allVals) + 1;
+        const range = maxV - minV || 1;
+        const pad = 40;
+
+        const scaleX = (i) => pad + (i / Math.max(vals.length - 1, 1)) * (W - 2 * pad);
+        const scaleY = (v) => H - pad - ((v - minV) / range) * (H - 2 * pad);
+
+        // Control limits
+        ctx.setLineDash([5, 5]);
+        ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(pad, scaleY(ucl)); ctx.lineTo(W - pad, scaleY(ucl)); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(pad, scaleY(lcl)); ctx.lineTo(W - pad, scaleY(lcl)); ctx.stroke();
+        ctx.strokeStyle = '#22c55e';
+        ctx.beginPath(); ctx.moveTo(pad, scaleY(cl)); ctx.lineTo(W - pad, scaleY(cl)); ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Data line
+        ctx.strokeStyle = '#1e90ff'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        vals.forEach((v, i) => { i === 0 ? ctx.moveTo(scaleX(i), scaleY(v)) : ctx.lineTo(scaleX(i), scaleY(v)); });
+        ctx.stroke();
+
+        // Points
+        vals.forEach((v, i) => {
+            ctx.fillStyle = (v > ucl || v < lcl) ? '#ef4444' : '#1e90ff';
+            ctx.beginPath(); ctx.arc(scaleX(i), scaleY(v), 3, 0, Math.PI * 2); ctx.fill();
+        });
+
+        // Labels
+        ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+        ctx.fillText('UCL: ' + ucl, W - pad + 4, scaleY(ucl) + 4);
+        ctx.fillText('LCL: ' + lcl, W - pad + 4, scaleY(lcl) + 4);
+        ctx.fillText('CL: ' + cl, W - pad + 4, scaleY(cl) + 4);
+    }
+
+    // ─── Condition Monitoring ─────────────────────────────────────
+
+    async function cmRefresh() {
+        const machine = document.getElementById('cm-machine-select')?.value || 'MX100';
+        const defect = document.getElementById('cm-defect-select')?.value || '';
+        try {
+            const defectParam = defect ? '?defect=' + defect : '';
+            const [specRes, isoRes, bearRes, rulRes] = await Promise.all([
+                fetch('/api/cm/' + machine + '/spectrum' + defectParam),
+                fetch('/api/cm/' + machine + '/iso10816'),
+                fetch('/api/cm/' + machine + '/bearing'),
+                fetch('/api/cm/' + machine + '/rul'),
+            ]);
+            const spec = await specRes.json();
+            const iso = await isoRes.json();
+            const bear = await bearRes.json();
+            const rul = await rulRes.json();
+
+            // FFT spectrum chart
+            drawFFTChart(spec);
+
+            // ISO 10816
+            const zoneColors = {'A':'#22c55e','B':'#3b82f6','C':'#f59e0b','D':'#ef4444'};
+            const zEl = document.getElementById('cm-zone-letter');
+            const zlEl = document.getElementById('cm-zone-label');
+            const rmsEl = document.getElementById('cm-rms');
+            if (zEl) { zEl.textContent = iso.zone || '--'; zEl.style.color = zoneColors[iso.zone] || '#888'; }
+            if (zlEl) zlEl.textContent = iso.label || '--';
+            if (rmsEl) rmsEl.textContent = 'RMS: ' + (iso.rms_velocity || '--') + ' mm/s';
+
+            // Bearing
+            const bDiv = document.getElementById('cm-bearing-freqs');
+            if (bDiv) {
+                const freqs = bear.defect_frequencies || {};
+                let html = Object.entries(freqs).map(([k,v]) =>
+                    '<div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border-color);">' +
+                    '<span style="font-weight:600;">' + k + '</span><span>' + v + ' Hz</span></div>'
+                ).join('');
+                if (bear.defects && bear.defects.length > 0) {
+                    html += '<div style="margin-top:12px; color:#ef4444; font-weight:600;">Tespit Edilen Arizalar:</div>';
+                    html += bear.defects.map(d =>
+                        '<div style="padding:6px; margin:4px 0; background:var(--bg-primary); border-radius:4px; border-left:3px solid ' +
+                        (d.severity === 'high' ? '#ef4444' : d.severity === 'medium' ? '#f59e0b' : '#3b82f6') + ';">' +
+                        d.type + ' — ' + d.frequency + ' Hz (amp: ' + d.amplitude + ')</div>'
+                    ).join('');
+                } else {
+                    html += '<div style="margin-top:12px; color:#22c55e;">Yatak saglikli</div>';
+                }
+                bDiv.innerHTML = html;
+            }
+
+            // RUL
+            const rulHEl = document.getElementById('cm-rul-hours');
+            const rulCEl = document.getElementById('cm-rul-confidence');
+            const rulTEl = document.getElementById('cm-rul-trend');
+            if (rulHEl) rulHEl.textContent = rul.rul_hours >= 0 ? rul.rul_hours : '--';
+            if (rulCEl) rulCEl.textContent = 'Guven: ' + (rul.confidence ? Math.round(rul.confidence * 100) + '%' : '--%');
+            if (rulTEl) rulTEl.textContent = rul.message || rul.trend || '';
+        } catch(e) { console.error('CM refresh error:', e); }
+    }
+
+    function drawFFTChart(spec) {
+        const canvas = document.getElementById('cm-fft-canvas');
+        if (!canvas || !spec.frequencies || spec.frequencies.length === 0) return;
+        const ctx = canvas.getContext('2d');
+        const W = canvas.parentElement.clientWidth - 24;
+        const H = 220;
+        canvas.width = W; canvas.height = H;
+        ctx.clearRect(0, 0, W, H);
+
+        const freqs = spec.frequencies;
+        const amps = spec.amplitudes;
+        const maxAmp = Math.max(...amps) * 1.2 || 1;
+        const pad = 40;
+
+        const scaleX = (i) => pad + (i / freqs.length) * (W - 2 * pad);
+        const scaleY = (a) => H - pad - (a / maxAmp) * (H - 2 * pad);
+
+        // Bars
+        const barW = Math.max(1, (W - 2 * pad) / freqs.length - 1);
+        amps.forEach((a, i) => {
+            ctx.fillStyle = a > maxAmp * 0.5 ? '#ef4444' : '#1e90ff';
+            ctx.fillRect(scaleX(i), scaleY(a), barW, H - pad - scaleY(a));
+        });
+
+        // Mark bearing frequencies
+        const bf = spec.bearing_frequencies || {};
+        ctx.font = '9px monospace';
+        Object.entries(bf).forEach(([name, freq]) => {
+            const idx = freqs.findIndex(f => Math.abs(f - freq) < (freqs[1] - freqs[0]));
+            if (idx >= 0) {
+                ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 1;
+                ctx.setLineDash([3,3]);
+                const x = scaleX(idx);
+                ctx.beginPath(); ctx.moveTo(x, pad); ctx.lineTo(x, H - pad); ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.fillStyle = '#f59e0b';
+                ctx.fillText(name, x - 10, pad - 4);
+            }
+        });
+
+        // Axis labels
+        ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+        ctx.fillText('0 Hz', pad, H - 10);
+        ctx.fillText(Math.round(freqs[freqs.length - 1]) + ' Hz', W - pad - 30, H - 10);
+    }
+
+    // ─── Energy Monitoring ────────────────────────────────────────
+
+    async function updateEnergy() {
+        try {
+            const res = await fetch('/api/energy/summary');
+            const data = await res.json();
+
+            const totalEl = document.getElementById('energy-total-kwh');
+            const perPartEl = document.getElementById('energy-kwh-part');
+            const co2El = document.getElementById('energy-co2');
+            if (totalEl) totalEl.textContent = data.total_kwh || '0';
+            if (perPartEl) perPartEl.textContent = data.avg_kwh_per_part || '0';
+            if (co2El) co2El.textContent = data.total_co2_kg || '0';
+
+            // Realtime per machine
+            const rtDiv = document.getElementById('energy-realtime');
+            const machinesDiv = document.getElementById('energy-machines');
+            const machines = data.machines || {};
+            const mKeys = Object.keys(machines);
+            if (rtDiv && mKeys.length > 0) {
+                rtDiv.innerHTML = mKeys.map(code => {
+                    const m = machines[code];
+                    return '<div style="display:flex; justify-content:space-between; padding:8px; border-bottom:1px solid var(--border-color);">' +
+                        '<span style="font-weight:600;">' + code + '</span>' +
+                        '<span>' + (m.current_power_kw || 0) + ' kW</span>' +
+                    '</div>';
+                }).join('');
+            }
+            if (machinesDiv && mKeys.length > 0) {
+                machinesDiv.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
+                    '<tr style="border-bottom:2px solid var(--border-color);"><th style="text-align:left; padding:8px;">Makine</th><th>Guc (kW)</th><th>Vardiya kWh</th><th>kWh/parca</th><th>CO2 (kg)</th><th>Hedef</th></tr>' +
+                    mKeys.map(code => {
+                        const m = machines[code];
+                        const targetColor = m.on_target ? '#22c55e' : '#ef4444';
+                        return '<tr style="border-bottom:1px solid var(--border-color);">' +
+                            '<td style="padding:8px; font-weight:600;">' + code + '</td>' +
+                            '<td style="text-align:center;">' + m.current_power_kw + '</td>' +
+                            '<td style="text-align:center;">' + m.shift_kwh + '</td>' +
+                            '<td style="text-align:center;">' + m.kwh_per_part + '</td>' +
+                            '<td style="text-align:center;">' + m.co2_kg + '</td>' +
+                            '<td style="text-align:center; color:' + targetColor + ';">' + (m.on_target ? 'OK' : 'ASIM') + '</td></tr>';
+                    }).join('') + '</table>';
+            }
+        } catch(e) { console.error('Energy update error:', e); }
+    }
+
+    // ─── MES Work Orders ──────────────────────────────────────────
+
+    async function mesRefresh() {
+        try {
+            const [ordRes, shiftRes] = await Promise.all([
+                fetch('/api/mes/orders'),
+                fetch('/api/mes/shift-report'),
+            ]);
+            const ordData = await ordRes.json();
+            const shiftData = await shiftRes.json();
+
+            const listDiv = document.getElementById('mes-orders-list');
+            const orders = ordData.orders || [];
+            if (listDiv) {
+                const statusColors = {planned:'#6b7280', started:'#22c55e', paused:'#f59e0b', completed:'#3b82f6', cancelled:'#ef4444'};
+                const statusLabels = {planned:'Planli', started:'Devam', paused:'Durdu', completed:'Tamam', cancelled:'Iptal'};
+                listDiv.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
+                    '<tr style="border-bottom:2px solid var(--border-color);"><th style="text-align:left; padding:8px;">Emir No</th><th>Urun</th><th>Makine</th><th>Hedef</th><th>Gercek</th><th>Fire</th><th>Durum</th><th>OEE</th><th>Islem</th></tr>' +
+                    orders.map(o => {
+                        const sc = statusColors[o.status] || '#888';
+                        const btns = o.status === 'planned' ? '<button class="btn btn-primary" style="padding:4px 8px; font-size:11px;" onclick="SmartFactory.mesAction(\\'' + o.wo_number + '\\',\\'start\\')">Baslat</button>' :
+                            o.status === 'started' ? '<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px;" onclick="SmartFactory.mesAction(\\'' + o.wo_number + '\\',\\'pause\\')">Durdur</button> <button class="btn btn-primary" style="padding:4px 8px; font-size:11px;" onclick="SmartFactory.mesAction(\\'' + o.wo_number + '\\',\\'complete\\')">Bitir</button>' :
+                            o.status === 'paused' ? '<button class="btn btn-primary" style="padding:4px 8px; font-size:11px;" onclick="SmartFactory.mesAction(\\'' + o.wo_number + '\\',\\'start\\')">Devam</button>' : '';
+                        return '<tr style="border-bottom:1px solid var(--border-color);">' +
+                            '<td style="padding:8px; font-weight:600;">' + o.wo_number + '</td>' +
+                            '<td>' + o.product_code + '</td><td>' + o.machine_code + '</td>' +
+                            '<td style="text-align:center;">' + o.target_qty + '</td>' +
+                            '<td style="text-align:center;">' + o.actual_qty + '</td>' +
+                            '<td style="text-align:center;">' + o.scrap_qty + '</td>' +
+                            '<td><span style="color:' + sc + '; font-weight:600;">' + (statusLabels[o.status] || o.status) + '</span></td>' +
+                            '<td style="text-align:center;">' + (o.oee?.oee || '--') + '%</td>' +
+                            '<td>' + btns + '</td></tr>';
+                    }).join('') + '</table>';
+            }
+
+            // Shift report
+            const shiftDiv = document.getElementById('mes-shift-report');
+            if (shiftDiv) {
+                shiftDiv.innerHTML =
+                    '<div style="display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">' +
+                    '<div style="text-align:center;"><div style="font-size:20px; font-weight:700;">' + (shiftData.shift_orders || 0) + '</div><div style="color:var(--text-muted); font-size:11px;">Emir Sayisi</div></div>' +
+                    '<div style="text-align:center;"><div style="font-size:20px; font-weight:700;">' + (shiftData.fulfillment_pct || 0) + '%</div><div style="color:var(--text-muted); font-size:11px;">Gerceklesme</div></div>' +
+                    '<div style="text-align:center;"><div style="font-size:20px; font-weight:700;">' + (shiftData.total_actual || 0) + '/' + (shiftData.total_target || 0) + '</div><div style="color:var(--text-muted); font-size:11px;">Uretim</div></div>' +
+                    '<div style="text-align:center;"><div style="font-size:20px; font-weight:700;">' + (shiftData.quality_pct || 100) + '%</div><div style="color:var(--text-muted); font-size:11px;">Kalite</div></div>' +
+                    '</div>';
+            }
+        } catch(e) { console.error('MES refresh error:', e); }
+    }
+
+    function mesShowCreateForm() {
+        const form = document.getElementById('mes-create-form');
+        if (form) form.style.display = form.style.display === 'none' ? 'block' : 'none';
+    }
+
+    async function mesCreateOrder() {
+        const product = document.getElementById('mes-product')?.value;
+        const machine = document.getElementById('mes-machine')?.value;
+        const qty = parseInt(document.getElementById('mes-qty')?.value || '0');
+        if (!product || !qty) return;
+        await fetch('/api/mes/orders', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({product_code: product, machine_code: machine, target_qty: qty})
+        });
+        document.getElementById('mes-create-form').style.display = 'none';
+        mesRefresh();
+    }
+
+    async function mesAction(woNumber, action) {
+        await fetch('/api/mes/orders/' + woNumber + '/' + action, {method: 'POST'});
+        mesRefresh();
+    }
+
+    // ─── Recipe Management ────────────────────────────────────────
+
+    async function mesLoadRecipes() {
+        try {
+            const res = await fetch('/api/mes/recipes');
+            const data = await res.json();
+            const listDiv = document.getElementById('mes-recipes-list');
+            const recipes = data.recipes || [];
+            if (listDiv) {
+                const statusColors = {draft:'#6b7280', active:'#22c55e', deprecated:'#ef4444'};
+                listDiv.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
+                    '<tr style="border-bottom:2px solid var(--border-color);"><th style="text-align:left; padding:8px;">Kod</th><th>Urun</th><th>Versiyon</th><th>Durum</th><th>Aciklama</th><th>Islem</th></tr>' +
+                    recipes.map(r => {
+                        const sc = statusColors[r.status] || '#888';
+                        return '<tr style="border-bottom:1px solid var(--border-color); cursor:pointer;" onclick="SmartFactory.mesRecipeDetail(\\'' + r.recipe_code + '\\')">' +
+                            '<td style="padding:8px; font-weight:600;">' + r.recipe_code + '</td>' +
+                            '<td>' + r.product_code + '</td>' +
+                            '<td style="text-align:center;">v' + r.version + '</td>' +
+                            '<td><span style="color:' + sc + ';">' + r.status + '</span></td>' +
+                            '<td style="color:var(--text-secondary);">' + (r.description || '') + '</td>' +
+                            '<td><button class="btn btn-secondary" style="padding:4px 8px; font-size:11px;" onclick="event.stopPropagation(); SmartFactory.mesApplyRecipe(\\'' + r.recipe_code + '\\')">Uygula</button></td></tr>';
+                    }).join('') + '</table>';
+            }
+        } catch(e) { console.error('Recipes load error:', e); }
+    }
+
+    async function mesRecipeDetail(code) {
+        try {
+            const [detRes, auditRes] = await Promise.all([
+                fetch('/api/mes/recipes/' + code),
+                fetch('/api/mes/recipes/' + code + '/audit'),
+            ]);
+            const det = await detRes.json();
+            const audit = await auditRes.json();
+
+            const detDiv = document.getElementById('mes-recipe-detail');
+            if (detDiv && det.parameters) {
+                detDiv.innerHTML = '<h4 style="margin-bottom:8px;">' + det.recipe_code + ' (v' + det.version + ')</h4>' +
+                    '<table style="width:100%; border-collapse:collapse;">' +
+                    '<tr style="border-bottom:2px solid var(--border-color);"><th style="text-align:left; padding:6px;">Parametre</th><th>Deger</th><th>Birim</th><th>Min</th><th>Max</th></tr>' +
+                    det.parameters.map(p =>
+                        '<tr style="border-bottom:1px solid var(--border-color);">' +
+                        '<td style="padding:6px;">' + p.param_name + '</td>' +
+                        '<td style="text-align:center; font-weight:600;">' + p.param_value + '</td>' +
+                        '<td style="text-align:center;">' + (p.unit || '') + '</td>' +
+                        '<td style="text-align:center; color:var(--text-muted);">' + (p.min_value ?? '-') + '</td>' +
+                        '<td style="text-align:center; color:var(--text-muted);">' + (p.max_value ?? '-') + '</td></tr>'
+                    ).join('') + '</table>';
+            }
+
+            const auditDiv = document.getElementById('mes-recipe-audit');
+            if (auditDiv && audit.audit) {
+                auditDiv.innerHTML = audit.audit.map(a => {
+                    const dt = new Date(a.timestamp * 1000).toLocaleString('tr-TR');
+                    return '<div style="padding:6px; border-bottom:1px solid var(--border-color); font-size:12px;">' +
+                        '<span style="color:var(--accent-cyan); font-weight:600;">' + a.action + '</span> — ' +
+                        '<span style="color:var(--text-muted);">' + dt + ' (' + a.changed_by + ')</span></div>';
+                }).join('');
+            }
+        } catch(e) { console.error('Recipe detail error:', e); }
+    }
+
+    async function mesApplyRecipe(code) {
+        const machine = prompt('Makine kodu (MX100/MX200):', 'MX100');
+        if (!machine) return;
+        const res = await fetch('/api/mes/recipes/' + code + '/apply/' + machine, {method:'POST'});
+        const data = await res.json();
+        if (data.ok) alert('Recete uygulandi: ' + JSON.stringify(data.parameters_written));
+    }
+
+    // ─── Traceability ─────────────────────────────────────────────
+
+    async function traceSearch() {
+        const query = document.getElementById('trace-search')?.value || '';
+        try {
+            let url = '/api/trace/parts?limit=50';
+            if (query.startsWith('BATCH')) url = '/api/trace/parts?batch_number=' + query;
+            else if (query.startsWith('WO')) url = '/api/trace/parts?wo_number=' + query;
+            else if (query) {
+                const partRes = await fetch('/api/trace/parts/' + query);
+                const part = await partRes.json();
+                if (!part.error) {
+                    traceShowDetail(part);
+                    return;
+                }
+            }
+            const res = await fetch(url);
+            const data = await res.json();
+            const listDiv = document.getElementById('trace-parts-list');
+            const parts = data.parts || [];
+            if (listDiv) {
+                listDiv.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
+                    '<tr style="border-bottom:2px solid var(--border-color);"><th style="text-align:left; padding:8px;">DMC</th><th>Urun</th><th>Makine</th><th>Batch</th><th>Kalite</th><th>Tarih</th></tr>' +
+                    parts.map(p => {
+                        const dt = new Date(p.produced_at * 1000).toLocaleString('tr-TR');
+                        const qColor = p.quality_status === 'ok' ? '#22c55e' : '#ef4444';
+                        return '<tr style="border-bottom:1px solid var(--border-color); cursor:pointer;" onclick="SmartFactory.traceDetail(\\'' + p.dmc_code + '\\')">' +
+                            '<td style="padding:8px; font-weight:600; font-size:11px;">' + p.dmc_code + '</td>' +
+                            '<td>' + p.product_code + '</td><td>' + p.machine_code + '</td>' +
+                            '<td>' + p.batch_number + '</td>' +
+                            '<td style="color:' + qColor + ';">' + p.quality_status + '</td>' +
+                            '<td style="color:var(--text-muted); font-size:11px;">' + dt + '</td></tr>';
+                    }).join('') + '</table>';
+            }
+
+            // Stats
+            const statsRes = await fetch('/api/trace/stats');
+            const stats = await statsRes.json();
+            const statsDiv = document.getElementById('trace-stats');
+            if (statsDiv) {
+                statsDiv.innerHTML =
+                    '<div style="display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">' +
+                    '<div style="text-align:center;"><div style="font-size:20px; font-weight:700;">' + (stats.total_parts || 0) + '</div><div style="color:var(--text-muted); font-size:11px;">Toplam Parca</div></div>' +
+                    '<div style="text-align:center;"><div style="font-size:20px; font-weight:700;">' + (stats.total_batches || 0) + '</div><div style="color:var(--text-muted); font-size:11px;">Batch Sayisi</div></div></div>';
+            }
+        } catch(e) { console.error('Trace search error:', e); }
+    }
+
+    async function traceDetail(dmc) {
+        try {
+            const res = await fetch('/api/trace/parts/' + dmc);
+            const part = await res.json();
+            traceShowDetail(part);
+        } catch(e) { console.error('Trace detail error:', e); }
+    }
+
+    function traceShowDetail(part) {
+        const detDiv = document.getElementById('trace-detail');
+        if (!detDiv || part.error) return;
+        detDiv.innerHTML =
+            '<h4 style="margin-bottom:8px;">' + part.dmc_code + '</h4>' +
+            '<div style="display:grid; grid-template-columns:1fr 1fr; gap:4px; font-size:12px;">' +
+            '<div>Urun: <b>' + part.product_code + '</b></div>' +
+            '<div>Makine: <b>' + part.machine_code + '</b></div>' +
+            '<div>Is Emri: <b>' + (part.wo_number || '-') + '</b></div>' +
+            '<div>Recete: <b>' + (part.recipe_code || '-') + '</b></div>' +
+            '<div>Batch: <b>' + part.batch_number + '</b></div>' +
+            '<div>Kalite: <b>' + part.quality_status + '</b></div></div>' +
+            (part.parameters ? '<div style="margin-top:12px;"><b>Uretim Parametreleri:</b><br>' +
+                Object.entries(part.parameters).map(([k,v]) => k + ': ' + v).join(' | ') + '</div>' : '') +
+            (part.events ? '<div style="margin-top:12px;"><b>Olaylar:</b>' +
+                part.events.map(e => '<div style="padding:4px 0; border-bottom:1px solid var(--border-color); font-size:11px;">' +
+                    e.event_type + ' — ' + new Date(e.timestamp * 1000).toLocaleString('tr-TR') + '</div>').join('') + '</div>' : '');
+    }
+
+    // ─── Edge Computing ───────────────────────────────────────────
+
+    async function updateEdge() {
+        try {
+            const [statusRes, rulesRes] = await Promise.all([
+                fetch('/api/edge/status'),
+                fetch('/api/edge/rules'),
+            ]);
+            const status = await statusRes.json();
+            const rules = await rulesRes.json();
+
+            const statusDiv = document.getElementById('edge-status');
+            if (statusDiv) {
+                statusDiv.innerHTML =
+                    '<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">' +
+                    '<div>Mod: <b>' + (status.mode || 'standalone') + '</b></div>' +
+                    '<div>Aktif Kural: <b>' + (status.rules?.active_rules || 0) + '</b></div>' +
+                    '<div>Toplam Tetikleme: <b>' + (status.rules?.total_triggers || 0) + '</b></div></div>';
+            }
+
+            const bufDiv = document.getElementById('edge-buffer');
+            const buf = status.buffer || {};
+            if (bufDiv) {
+                bufDiv.innerHTML =
+                    '<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">' +
+                    '<div>Buffered: <b>' + (buf.buffered_count || 0) + '</b></div>' +
+                    '<div>Max: <b>' + (buf.max_size || 0) + '</b></div></div>';
+            }
+
+            const rulesDiv = document.getElementById('edge-rules-list');
+            const ruleList = rules.rules || [];
+            if (rulesDiv) {
+                rulesDiv.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
+                    '<tr style="border-bottom:2px solid var(--border-color);"><th style="text-align:left; padding:8px;">ID</th><th>Sensor</th><th>Kosul</th><th>Esik</th><th>Aksiyon</th><th>Tetikleme</th></tr>' +
+                    ruleList.map(r =>
+                        '<tr style="border-bottom:1px solid var(--border-color);">' +
+                        '<td style="padding:8px; font-weight:600;">' + r.rule_id + '</td>' +
+                        '<td>' + r.sensor + '</td><td style="text-align:center;">' + r.operator + '</td>' +
+                        '<td style="text-align:center;">' + r.threshold + '</td>' +
+                        '<td>' + r.action + '</td>' +
+                        '<td style="text-align:center;">' + r.trigger_count + '</td></tr>'
+                    ).join('') + '</table>';
+            }
+        } catch(e) { console.error('Edge update error:', e); }
+    }
+
+    async function edgeSync() {
+        const res = await fetch('/api/edge/sync', {method:'POST'});
+        const data = await res.json();
+        alert('Senkronize edildi: ' + (data.forwarded || 0) + ' mesaj');
+        updateEdge();
+    }
+
+    // ─── Select change handlers ──────────────────────────────────
+
     return {
         init,
         startSystem,
+        startGateway,
         ackAlarm,
         refreshAll,
         ragQuery,
@@ -3374,7 +4696,22 @@ const SmartFactory = (function() {
         ragSaveBuiltin,
         switchMode,
         erpPredict,
-        erpRefreshAll
+        erpRefreshAll,
+        packmlSendCommand,
+        updatePackML,
+        twinCalibrate,
+        cmRefresh,
+        mesShowCreateForm,
+        mesCreateOrder,
+        mesAction,
+        mesRefresh,
+        mesRecipeDetail,
+        mesApplyRecipe,
+        mesLoadRecipes,
+        traceSearch,
+        traceDetail,
+        edgeSync,
+        updateEdge
     };
 })();
 
@@ -3401,5 +4738,4 @@ def index():
 
 if __name__ == "__main__":
     import uvicorn
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     uvicorn.run("ui:app", host="0.0.0.0", port=8000, reload=False)
